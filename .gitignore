@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+.hermes/
+tests/e2e/.out/
+*.log
+.DS_Store
+__pycache__/

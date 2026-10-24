@@ -1,0 +1,21 @@
+{{- if .Values.gateway.enabled }}
+{{- $ctx := dict "ctx" $ "component" "gateway" }}
+{{- $v := .Values.gateway }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "platform.componentName" $ctx }}
+  labels:
+    {{- include "platform.labels" $ctx | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "platform.selectorLabels" $ctx | nindent 6 }}
+  template:
+    {{- include "platform.gatewayPodTemplate" (dict
+      "ctx" $
+      "component" "gateway"
+      "image" (printf "%s:%s" $v.image.repository ($v.image.tag | default .Chart.AppVersion))
+      "pullPolicy" $v.image.pullPolicy) | nindent 4 }}
+{{- end }}
