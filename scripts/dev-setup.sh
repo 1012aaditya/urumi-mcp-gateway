@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs the tools needed to build and run the project locally.
+# Installs the tools Hermes and Claude Code need.
 # macOS: uses Homebrew. Linux (Ubuntu/WSL2): uses apt + official installers.
 # Safe to re-run: skips anything already installed. Works with macOS's bash 3.2.
 set -euo pipefail
@@ -17,8 +17,8 @@ if [ "$OS" = "Darwin" ]; then
   fi
   brew --version | head -1
 
-  say "CLI tools (git, jq, node@22, kubectl, helm, k3d, coreutils)"
-  for f in git jq node@22 kubectl helm k3d coreutils; do
+  say "CLI tools (git, jq, node@22, kubectl, helm, k3d, glab, coreutils)"
+  for f in git jq node@22 kubectl helm k3d glab coreutils; do
     if brew list --formula "$f" >/dev/null 2>&1; then echo "ok  $f"; else brew install "$f"; fi
   done
   # node@22 is keg-only: put it on PATH for this run and tell the user to persist it
@@ -60,10 +60,15 @@ else
   fi
   have helm || curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
   have k3d  || curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+  have glab || echo "Install glab: https://gitlab.com/gitlab-org/cli#installation"
 fi
 
+say "Claude Code"
+have claude || curl -fsSL https://claude.ai/install.sh | bash
+export PATH="$HOME/.local/bin:$PATH"
+
 say "Versions"
-for c in git jq node kubectl helm k3d docker; do
+for c in git jq node kubectl helm k3d glab claude docker; do
   if have "$c"; then
     case "$c" in
       kubectl) printf '%-8s %s\n' "$c" "$(kubectl version --client 2>/dev/null | head -1)";;
@@ -76,5 +81,8 @@ done
 
 say "Next"
 cat <<'EOF'
-Re-run this script until nothing says MISSING, then follow README.md "Zero to running".
+1. claude setup-token   -> copy the token into Hermes's env as CLAUDE_CODE_OAUTH_TOKEN
+                           (or set ANTHROPIC_API_KEY there instead)
+2. glab auth login      -> in Hermes's environment, as the Hermes bot account (Developer role)
+3. Re-run this script until nothing says MISSING
 EOF

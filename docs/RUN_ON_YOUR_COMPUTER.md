@@ -61,7 +61,7 @@ computer (127.0.0.1). Nothing is exposed to the internet.
 ### 1. Get the code
 
 ```sh
-git clone https://github.com/1012aaditya/urumi-mcp-gateway.git urumi
+git clone https://gitlab.com/gitlab-ai-hackathon/transcend-october-2026/36848717/showcase.git urumi
 cd urumi
 ```
 
@@ -118,13 +118,15 @@ Without a GitLab token:
 E2E_SKIP_GITLAB=1 tests/e2e/run.sh seed
 ```
 
-With a GitLab token in `.env.local`, run all eight demo checks instead:
+With a GitLab token in `.env.local`, run all the demo checks instead:
 
 ```sh
-tests/e2e/run.sh all       # prints PASS seed, PASS D1 … PASS D8
+tests/e2e/run.sh all       # prints PASS seed, PASS D1 … PASS D15
 ```
 
-Without the GitLab token, D3 and D4 expect the GitLab server and will fail; that is expected.
+Without the GitLab token, `run.sh all` stops at the seed (it expects all three tool servers); use
+`E2E_SKIP_GITLAB=1 tests/e2e/run.sh all`, and D3 (which lists the GitLab tools) fails, as
+expected. Without the Anthropic key, the chat checks D2, D4 and D12 fail.
 
 ### 6. Open it
 
@@ -139,7 +141,7 @@ See your logins: `grep -E '^(WP_ADMIN|SEED_ADMIN)_' .env.local`
 Things to try in the dashboard: **Upstreams** (the tool servers and whether they are up),
 **Members** (add users), **My keys** (make an API key for an AI app), **Chat** ("What orders came
 in today?"), **Audit** (every tool call, who made it, and whether it worked). The README's
-[demo walkthrough](../README.md#demo-walkthrough-manual-d1d8) has the full tour.
+[demo walkthrough](../README.md#demo-walkthrough-manual-d1d9) has the full tour.
 
 ## Stop, restart, remove
 
@@ -188,5 +190,5 @@ An AI app using an API key takes the same path, minus Claude: it calls the gatew
 directly, and the call is logged the same way. Tool names are always `<server>__<tool>`, so two
 servers can each have a tool called `search` without clashing.
 
-More detail: [`DESIGN.md`](DESIGN.md) (how it is built) and [`THREAT_MODEL.md`](THREAT_MODEL.md) (how
-it is secured).
+More detail: [`DESIGN.md`](DESIGN.md) (how it is built), [`THREAT_MODEL.md`](THREAT_MODEL.md) (how it
+is secured), [`HACKATHON.md`](HACKATHON.md) (the self-healing release pipeline).

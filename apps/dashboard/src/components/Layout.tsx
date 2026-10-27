@@ -24,9 +24,13 @@ export function Layout() {
           <NavLink to="/upstreams">Upstreams</NavLink>
           <NavLink to="/tools">Tools</NavLink>
           <NavLink to="/keys">My keys</NavLink>
+          <NavLink to="/connected-apps">Connected apps</NavLink>
           <NavLink to="/audit">Audit</NavLink>
           <NavLink to="/chat">Chat</NavLink>
           {user.role === 'admin' && <NavLink to="/members">Members</NavLink>}
+          {user.role === 'admin' && <NavLink to="/permissions">Permissions</NavLink>}
+          {user.role === 'admin' && <NavLink to="/stores">Stores</NavLink>}
+          {user.role === 'admin' && <NavLink to="/health">Health / Metrics</NavLink>}
         </nav>
         <div className="account">
           <span>{user.email}</span>

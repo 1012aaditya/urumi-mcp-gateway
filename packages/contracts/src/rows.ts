@@ -42,8 +42,51 @@ export interface UpstreamRow {
   status: 'unknown' | 'up' | 'down';
   last_error: string | null;
   last_checked_at: Date | null;
+  /** Last successful health check (004_observability.sql). */
+  last_ok_at: Date | null;
+  /** Created for a hosted server (006_hosted.sql): managed via /api/hosted-servers only. */
+  hosted: boolean;
+  /** The woo-mcp of a provisioned store (007_stores.sql): managed via /api/stores only. */
+  store: boolean;
   created_at: Date;
   updated_at: Date;
+}
+
+/** A hosted MCP server (006_hosted.sql, ADR 014). id = its upstream row's id. */
+export interface HostedServerRow {
+  id: string;
+  image: string;
+  image_digest: string | null;
+  port: number;
+  mcp_path: string;
+  preset: 'small' | 'medium';
+  egress: boolean;
+  env_keys: string[];
+  env_ciphertext: Uint8Array | null;
+  env_iv: Uint8Array | null;
+  env_tag: Uint8Array | null;
+  desired_state: 'present' | 'absent';
+  phase: 'deploying' | 'connected' | 'unreachable' | 'failed' | 'deleting';
+  reason: string | null;
+  created_by: string | null;
+  created_at: Date;
+  updated_at: Date;
+  last_reconciled_at: Date | null;
+}
+
+/** A provisioned WooCommerce store (007_stores.sql, ADR 015). id = its upstream row's id. */
+export interface StoreRow {
+  id: string;
+  admin_email: string;
+  desired_state: 'present' | 'absent';
+  phase: 'provisioning' | 'ready' | 'failed' | 'deleting';
+  reason: string | null;
+  generation: number;
+  provision_started_at: Date;
+  created_by: string | null;
+  created_at: Date;
+  updated_at: Date;
+  last_reconciled_at: Date | null;
 }
 
 export interface AuditLogRow {
@@ -55,6 +98,33 @@ export interface AuditLogRow {
   tool: string;
   started_at: Date;
   duration_ms: number;
-  outcome: 'ok' | 'error' | 'timeout' | 'denied';
+  outcome: 'ok' | 'error' | 'timeout' | 'denied' | 'rate_limited';
   error_code: string | null;
+  /** Fixed-vocabulary failure detail (004_observability.sql); null for ok. */
+  error_detail: string | null;
+  /** OAuth grant of an /mcp call made with an access token (005_oauth.sql); else null. */
+  oauth_grant_id: string | null;
+}
+
+/** 005_oauth.sql (ADR 013). Hash columns never leave the gateway's repo modules. */
+export interface OAuthClientRow {
+  id: string;
+  client_name: string;
+  redirect_uris: string[];
+  token_endpoint_auth_method: 'none' | 'client_secret_post' | 'client_secret_basic';
+  secret_hash: Buffer | null;
+  created_at: Date;
+}
+
+export interface OAuthGrantRow {
+  id: string;
+  client_id: string;
+  user_id: string;
+  scope: string;
+  resource: string;
+  created_at: Date;
+  activated_at: Date | null;
+  last_used_at: Date | null;
+  revoked_at: Date | null;
+  revoke_reason: 'user' | 'admin' | 'client' | 'refresh_reuse' | 'code_reuse' | null;
 }

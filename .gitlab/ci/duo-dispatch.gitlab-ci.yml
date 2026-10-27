@@ -1,0 +1,138 @@
+# Duo flow dispatch (#27, H4; docs/adr/007-duo-dispatch.md). GitLab starts a custom flow only when
+# its service account is mentioned, assigned or asked for review, and the flow's context:goal is
+# then the iid of that MR or issue. These jobs make that assignment, so the flows run without a
+# person clicking: scripts/duo/dispatch.py (stdlib, tests in scripts/duo/test_dispatch.py).
+#   duo:risk-gate                  every MR pipeline: request a review from the risk-gate account
+#                                  (.gitlab/flows/risk-gate.yaml, trigger Assign reviewer)
+#   duo:incident                   default branch, after `canary` failed: on ROLLBACK open the
+#                                  incident issue (canary record inside) and assign the incident
+#                                  account (.gitlab/flows/incident.yaml, trigger Assign)
+#   duo:incident:bad-release       the same after the manual `canary:bad-release` drill on the
+#                                  default branch. That job is allow_failure, and an allowed
+#                                  failure does not count for `when: on_failure`, so this one runs
+#                                  `when: always`; dispatch.py acts only on decision ROLLBACK.
+#   duo:postmortem                 autoheal/ MR pipelines (#33), after autoheal:report wrote the
+#                                  verdict block: on PROMOTE (or PROMOTE_PENDING_APPROVAL) post one
+#                                  note mentioning the postmortem account on the open autoheal MR
+#                                  (.gitlab/flows/postmortem.yaml, trigger Mention), before a person
+#                                  merges. autoheal:report always fails on purpose, so this runs
+#                                  `when: always` and dispatch.py decides from verdict.json; the
+#                                  note's `postmortem-dispatch: pipeline <id>` line makes it once
+#                                  per pipeline.
+#   duo:release-close              default branch (#34), after `canary` passed: on PROMOTE (or
+#                                  PROMOTE_PENDING_APPROVAL) close the incident of each merged
+#                                  autoheal MR in this commit (note, status::resolved) and its open
+#                                  regression issue. Not a flow dispatch; same token and template.
+# The only human action left in the loop is reviewing and merging the autoheal MR.
+# Token: CI/CD variable DUO_DISPATCH_TOKEN (project access token, api scope, Developer role; masked,
+# not protected, because MR pipelines need it; ADR 007 has the trade-off). Read from the
+# environment only, never echoed or passed as an argument. Unset: dispatch.py prints one line
+# and exits 0. allow_failure everywhere: dispatch never blocks a pipeline.
+.duo-dispatch:
+  image: python:3.12-alpine
+  cache: []
+  timeout: 2m
+  variables:
+    GIT_DEPTH: '1'
+
+duo:risk-gate:
+  extends: .duo-dispatch
+  stage: .pre
+  needs: []
+  interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      allow_failure: true
+  script:
+    - python3 scripts/duo/dispatch.py risk-gate "$CI_MERGE_REQUEST_IID"
+
+duo:incident:
+  extends: .duo-dispatch
+  stage: deploy
+  needs:
+    - job: canary
+      artifacts: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE != "merge_request_event" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_failure
+      allow_failure: true
+  script:
+    - python3 scripts/duo/dispatch.py incident --record verdict.json
+
+duo:incident:bad-release:
+  extends: .duo-dispatch
+  stage: deploy
+  needs:
+    - job: canary:bad-release
+      artifacts: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE != "merge_request_event" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: always
+      allow_failure: true
+  script:
+    - python3 scripts/duo/dispatch.py incident --record verdict.json
+
+duo:postmortem:
+  extends: .duo-dispatch
+  stage: deploy
+  needs:
+    - job: autoheal:report
+      artifacts: false
+    - job: canary
+      artifacts: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^autoheal\//
+      when: always
+      allow_failure: true
+  script:
+    - python3 scripts/duo/dispatch.py postmortem "$CI_MERGE_REQUEST_IID" --record verdict.json
+
+duo:release-close:
+  extends: .duo-dispatch
+  stage: deploy
+  needs:
+    - job: canary
+      artifacts: true
+    # A high-risk release (PROMOTE_PENDING_APPROVAL) is released only after a person runs
+    # release:human-approval; wait for it. Low-risk pipelines have no such job (optional).
+    - job: release:human-approval
+      optional: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE != "merge_request_event" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+      allow_failure: true
+  script:
+    - python3 scripts/duo/dispatch.py release-close --record verdict.json
+
+# Guardrails that learn (!54, docs/adr/016-learned-guardrails.md): after main's canary released a
+# merged autoheal fix, scripts/duo/guardrail.py opens an MR that makes every later change to the
+# files the fix touched high-risk (risk.py, release:human-approval rules:changes and the risk-gate
+# prompt, kept identical). That MR edits CI, so it is itself high-risk and a person merges it.
+duo:guardrail-learn:
+  extends: .duo-dispatch
+  stage: deploy
+  needs:
+    - job: canary
+      artifacts: true
+    - job: release:human-approval
+      optional: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE != "merge_request_event" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+      allow_failure: true
+  script:
+    - python3 scripts/duo/guardrail.py from-release --record verdict.json
+
+# Back-fill incidents healed before guardrail learning existed: one click on main, one incident
+# (the newest resolved one without a guardrail MR) per run. Manual, because pipeline variables are
+# maintainer-only in this project.
+duo:guardrail-backfill:
+  extends: .duo-dispatch
+  stage: deploy
+  needs: []
+  rules:
+    - if: $CI_PIPELINE_SOURCE != "merge_request_event" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
+  script:
+    - python3 scripts/duo/guardrail.py backfill

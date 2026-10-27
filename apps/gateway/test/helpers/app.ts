@@ -8,7 +8,7 @@ import { migrate } from '../../src/db/migrate.js';
 import { createPool } from '../../src/db/pool.js';
 import { seedAdmin } from '../../src/db/seed.js';
 import { buildApp, type AppDeps } from '../../src/server.js';
-import { freshDatabase } from './db.js';
+import { dropDatabase, freshDatabase } from './db.js';
 
 export const ADMIN = { email: 'admin@example.com', password: 'first-admin-password' };
 export const PUBLIC_ORIGIN = 'http://app.localtest.me';
@@ -35,10 +35,29 @@ export interface TestApp {
   close(): Promise<void>;
 }
 
-export async function setupApp(deps: Partial<AppDeps> = {}): Promise<TestApp> {
-  const pool = createPool(await freshDatabase());
+export interface SetupOptions {
+  /**
+   * 'seeded' keeps the default tool permissions of 002_tool_permissions.sql (members read-only
+   * on woo/everything/gitlab, nothing else). 'open' (default) adds a member `* *` allow rule so
+   * suites about aggregation, chat, audit and the MCP endpoint can call their fake upstreams as a
+   * member; test/permissions.test.ts covers the policy itself with 'seeded'.
+   */
+  toolPermissions?: 'open' | 'seeded';
+}
+
+export async function setupApp(
+  deps: Partial<AppDeps> = {},
+  opts: SetupOptions = {},
+): Promise<TestApp> {
+  const db = await freshDatabase();
+  const pool = createPool(db);
   await migrate(pool, MIGRATIONS_DIR);
   await seedAdmin(pool, ADMIN);
+  if ((opts.toolPermissions ?? 'open') === 'open') {
+    await pool.query(
+      `INSERT INTO tool_permissions (role, server_slug, tool, effect) VALUES ('member', '*', '*', 'allow')`,
+    );
+  }
   const app = buildApp({ pool, publicOrigin: PUBLIC_ORIGIN, encKey: ENC_KEY, ...deps });
   await app.ready();
 
@@ -75,6 +94,7 @@ export async function setupApp(deps: Partial<AppDeps> = {}): Promise<TestApp> {
     close: async () => {
       await app.close();
       await pool.end();
+      await dropDatabase(db);
     },
   };
 }
