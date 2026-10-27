@@ -26,8 +26,8 @@ app:
 dashboard:
   enabled: true
   image:
-    # Replace with your container registry path and a released tag.
-    repository: ghcr.io/<owner>/urumi-mcp-gateway/dashboard
+    # Replace with the project's GitLab container registry path and a released tag.
+    repository: registry.gitlab.com/<group>/<project>/dashboard
     tag: ''
     pullPolicy: IfNotPresent
 
@@ -38,6 +38,7 @@ mariadb:
     storageClass: ''
 
 wordpress:
+  runAsNonRoot: true
   persistence:
     size: 5Gi
     storageClass: ''
@@ -56,8 +57,8 @@ postgres:
 
 wooMcp:
   image:
-    # Replace with your container registry path and a released tag.
-    repository: ghcr.io/<owner>/urumi-mcp-gateway/woo-mcp
+    # Replace with the project's GitLab container registry path and a released tag.
+    repository: registry.gitlab.com/<group>/<project>/woo-mcp
     tag: ''
     pullPolicy: IfNotPresent
   # environmentType is `production`: in-cluster HTTP calls must claim HTTPS.
@@ -67,18 +68,51 @@ wooMcp:
 everything:
   enabled: true
   image:
-    # Replace with your container registry path and a released tag.
-    repository: ghcr.io/<owner>/urumi-mcp-gateway/everything
+    # Replace with the project's GitLab container registry path and a released tag.
+    repository: registry.gitlab.com/<group>/<project>/everything
     tag: ''
     pullPolicy: IfNotPresent
 
 gateway:
   image:
-    # Replace with your container registry path and a released tag.
-    repository: ghcr.io/<owner>/urumi-mcp-gateway/gateway
+    # Replace with the project's GitLab container registry path and a released tag.
+    repository: registry.gitlab.com/<group>/<project>/gateway
     tag: ''
     pullPolicy: IfNotPresent
   # Replace with the dashboard's HTTPS origin.
   publicOrigin: https://app.example.com
   cookieSecure: true
   chatModel: claude-sonnet-5-5
+  # Two replicas (ADR 010): a pod restart or node drain never takes /mcp down.
+  replicas: 2
+
+# Canary (#23): switched on/off by scripts/canary/run.sh; app.tls also secures its IngressRoute.
+gatewayCanary:
+  enabled: false
+
+# Default-deny NetworkPolicies + per-flow allows. The defaults match k3s (Traefik and CoreDNS in
+# kube-system); change ingressController / dns for another distribution. Set kubeApi.cidr to the
+# API server's address (kubectl get endpoints kubernetes) as <ip>/32 to narrow the bootstrap
+# Job's API egress.
+networkPolicy:
+  enabled: true
+  kubeApi:
+    cidr: 0.0.0.0/0
+  wordpressInternetEgress: true
+
+# Hosted MCP servers (ADR 014): on, with digest pinning and only this project's own registry path
+# allowed. Replace the prefix with your registry; add e.g. docker.io/mcp/ deliberately.
+hosted:
+  enabled: true
+  requireDigest: true
+  allowedImages:
+    - registry.gitlab.com/<group>/<project>/
+
+# Multiple stores (ADR 015): off in production unless you opt in. It gives the gateway cluster-wide
+# rights on namespaces (confined by the admission policy to store-* namespaces); turn it on
+# deliberately, with a wildcard DNS name + TLS for domainSuffix.
+multiStore:
+  enabled: false
+  maxStores: 3
+  domainSuffix: store.example.com
+  scheme: https

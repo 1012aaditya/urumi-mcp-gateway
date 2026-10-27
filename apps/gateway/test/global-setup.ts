@@ -53,9 +53,20 @@ export default async function setup(project: TestProject) {
     '-p',
     '127.0.0.1::5432',
     'postgres:16-alpine',
+    // Throwaway server: no durability needed, and a small WAL keeps the data volume small.
+    '-c',
+    'fsync=off',
+    '-c',
+    'full_page_writes=off',
+    '-c',
+    'max_wal_size=96MB',
+    '-c',
+    'min_wal_size=32MB',
   ]);
   const containerId = stdout.trim();
-  const stop = () => run('docker', ['rm', '-f', containerId]).then(() => undefined);
+  // -v: also delete the container's anonymous data volume. `--rm` alone does not when the
+  // container is removed with `docker rm -f`, and every run would leak its test databases (GBs).
+  const stop = () => run('docker', ['rm', '-f', '-v', containerId]).then(() => undefined);
 
   try {
     const port = (await run('docker', ['port', containerId, '5432/tcp'])).stdout

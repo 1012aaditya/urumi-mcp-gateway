@@ -8,17 +8,31 @@ import {
   ChangePasswordRequestSchema,
   ChatRequestSchema,
   ChatResponseSchema,
+  ConnectedAppListResponseSchema,
   CreateKeyRequestSchema,
   CreateKeyResponseSchema,
+  CreateHostedServerRequestSchema,
+  CreateStoreRequestSchema,
+  StoreListResponseSchema,
+  StoreResponseSchema,
   CreateUpstreamRequestSchema,
+  HostedServerListResponseSchema,
+  HostedServerResponseSchema,
   CreateUserRequestSchema,
   CreateUserResponseSchema,
   ErrorEnvelopeSchema,
   LoginRequestSchema,
+  MetricsSummaryResponseSchema,
+  OAuthDecisionRequestSchema,
+  OAuthDecisionResponseSchema,
+  OAuthRequestInfoSchema,
+  PermissionListResponseSchema,
+  PermissionResponseSchema,
   ROUTES,
   ToolListResponseSchema,
   UpdateUpstreamRequestSchema,
   UpdateUserRequestSchema,
+  UpsertPermissionRequestSchema,
   UpstreamListResponseSchema,
   UpstreamResponseSchema,
   UserListResponseSchema,
@@ -26,12 +40,15 @@ import {
   type AuditQuery,
   type ChatRequest,
   type ChangePasswordRequest,
+  type CreateHostedServerRequest,
+  type CreateStoreRequest,
   type CreateUpstreamRequest,
   type CreateUserRequest,
   type ErrorCode,
   type LoginRequest,
   type UpdateUpstreamRequest,
   type UpdateUserRequest,
+  type UpsertPermissionRequest,
 } from '@urumi/contracts';
 import type { z } from 'zod';
 
@@ -195,6 +212,22 @@ export const api = {
       schema: undefined,
     }),
 
+  listPermissions: async () =>
+    request(ROUTES.listPermissions.path, { schema: PermissionListResponseSchema }).then(
+      (r) => r.rules,
+    ),
+  upsertPermission: async (body: UpsertPermissionRequest) =>
+    request(ROUTES.upsertPermission.path, {
+      method: 'POST',
+      body: checked(UpsertPermissionRequestSchema, body),
+      schema: PermissionResponseSchema,
+    }).then((r) => r.rule),
+  deletePermission: async (id: string) =>
+    request(routePath(ROUTES.deletePermission.path, { id }), {
+      method: 'DELETE',
+      schema: undefined,
+    }),
+
   listKeys: async () =>
     request(ROUTES.listKeys.path, { schema: ApiKeyListResponseSchema }).then((r) => r.keys),
   createKey: async (name: string) =>
@@ -227,6 +260,38 @@ export const api = {
       method: 'DELETE',
       schema: undefined,
     }),
+  // Hosted MCP servers (ADR 014), admin only. Env values go out once and never come back.
+  listHostedServers: async () =>
+    request(ROUTES.listHostedServers.path, { schema: HostedServerListResponseSchema }),
+  createHostedServer: async (body: CreateHostedServerRequest) =>
+    request(ROUTES.createHostedServer.path, {
+      method: 'POST',
+      body: checked(CreateHostedServerRequestSchema, body),
+      schema: HostedServerResponseSchema,
+    }).then((r) => r.server),
+  deleteHostedServer: async (id: string) =>
+    request(routePath(ROUTES.deleteHostedServer.path, { id }), {
+      method: 'DELETE',
+      schema: undefined,
+    }),
+  // Stores (ADR 015), admin only. No password is ever sent or returned.
+  listStores: async () => request(ROUTES.listStores.path, { schema: StoreListResponseSchema }),
+  createStore: async (body: CreateStoreRequest) =>
+    request(ROUTES.createStore.path, {
+      method: 'POST',
+      body: checked(CreateStoreRequestSchema, body),
+      schema: StoreResponseSchema,
+    }).then((r) => r.store),
+  retryStore: async (id: string) =>
+    request(routePath(ROUTES.retryStore.path, { id }), {
+      method: 'POST',
+      schema: StoreResponseSchema,
+    }).then((r) => r.store),
+  deleteStore: async (id: string) =>
+    request(routePath(ROUTES.deleteStore.path, { id }), {
+      method: 'DELETE',
+      schema: StoreResponseSchema,
+    }).then((r) => r.store),
   listUpstreamTools: async (id: string) =>
     request(routePath(ROUTES.listUpstreamTools.path, { id }), {
       schema: ToolListResponseSchema,
@@ -234,9 +299,33 @@ export const api = {
   listTools: async () =>
     request(ROUTES.listTools.path, { schema: ToolListResponseSchema }).then((r) => r.tools),
 
+  metricsSummary: async (windowMinutes: number) =>
+    request(`${ROUTES.metricsSummary.path}?windowMinutes=${encodeURIComponent(windowMinutes)}`, {
+      schema: MetricsSummaryResponseSchema,
+    }),
+
   listAudit: async (query: Partial<AuditQuery>) =>
     request(`${ROUTES.listAudit.path}?${auditQueryString(query)}`, {
       schema: AuditListResponseSchema,
+    }),
+
+  // OAuth consent and connected apps (ADR 013).
+  getOAuthRequest: async (id: string) =>
+    request(routePath(ROUTES.getOAuthRequest.path, { id }), { schema: OAuthRequestInfoSchema }),
+  decideOAuthRequest: async (id: string, body: { approve: boolean; consentToken: string }) =>
+    request(routePath(ROUTES.decideOAuthRequest.path, { id }), {
+      method: 'POST',
+      body: checked(OAuthDecisionRequestSchema, body),
+      schema: OAuthDecisionResponseSchema,
+    }).then((r) => r.redirectTo),
+  listConnectedApps: async () =>
+    request(ROUTES.listConnectedApps.path, { schema: ConnectedAppListResponseSchema }).then(
+      (r) => r.apps,
+    ),
+  revokeConnectedApp: async (id: string) =>
+    request(routePath(ROUTES.revokeConnectedApp.path, { id }), {
+      method: 'DELETE',
+      schema: undefined,
     }),
 
   chat: async (body: ChatRequest) =>

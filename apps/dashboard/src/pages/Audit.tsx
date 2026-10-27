@@ -1,5 +1,5 @@
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
-import { OutcomeSchema, type AuditQuery } from '@urumi/contracts';
+import { describeFailure, OutcomeSchema, type AuditQuery } from '@urumi/contracts';
 import { useState, type FormEvent } from 'react';
 import { api } from '../api.js';
 import { useCurrentUser } from '../auth.js';
@@ -138,7 +138,17 @@ export function Audit() {
                 <tr key={a.id}>
                   <td>{formatTime(a.startedAt)}</td>
                   {isAdmin && <td>{a.userEmail}</td>}
-                  <td>{a.source}</td>
+                  <td>
+                    {a.source}
+                    {a.source === 'mcp' && (
+                      <span className="muted">
+                        {' · '}
+                        {a.authMethod === 'oauth'
+                          ? `OAuth: ${a.oauthClientName ?? 'app'}`
+                          : 'API key'}
+                      </span>
+                    )}
+                  </td>
                   <td>{a.serverSlug}</td>
                   <td>
                     <code>{a.tool}</code>
@@ -147,7 +157,12 @@ export function Audit() {
                     <Badge value={a.outcome} />
                   </td>
                   <td>{a.durationMs} ms</td>
-                  <td>{a.errorCode ?? ''}</td>
+                  <td>
+                    {a.errorCode ?? ''}
+                    {a.errorDetail && (
+                      <div className="muted">{describeFailure(a.errorDetail) ?? a.errorDetail}</div>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>

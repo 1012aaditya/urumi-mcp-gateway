@@ -7,6 +7,7 @@
 #     with a run-unique email (usera-<run>@urumi.test) is created instead and recorded.
 #   - registers + enables the 3 upstreams (seed-upstreams.sh) and waits until all are `up`
 #     (E2E_SKIP_GITLAB=1: woo + everything only)
+#   - grants User A woo__create_product (per-user tool permission; D2 creates a product as A)
 #   - signs in as A and B (cookie jars in .out/)
 #   - as B: revokes B's earlier e2e keys, creates key 1 (D3, revoked by D5) -> .out/userb.key and
 #     key 2 (D6, D7) -> .out/userb2.key, both mode 600
@@ -91,7 +92,7 @@ B_ID=$(jq -r .user.id "$LAST") B_EMAIL=$(jq -r .user.email "$LAST")
 # Upstreams: seed-upstreams.sh (also through the Ingress) re-sends each one with enabled: true.
 "$E2E_DIR/seed-upstreams.sh" >&2 || fail "seed-upstreams.sh failed"
 gw_login 2>/dev/null || fail "seed admin login failed"
-# E2E_SKIP_GITLAB=1 (no GitLab token): only woo + everything. D3/D4 need gitlab.
+# E2E_SKIP_GITLAB=1 (no GitLab token, e.g. the CI canary job): only woo + everything. D3/D4 need gitlab.
 SLUGS='["woo", "everything", "gitlab"]'
 [ "${E2E_SKIP_GITLAB:-0}" = 1 ] && SLUGS='["woo", "everything"]'
 all_up() {
@@ -100,6 +101,17 @@ all_up() {
       and .enabled and .status == "up")] | length' "$LAST")" = "$(printf '%s' "$SLUGS" | jq length)" ]
 }
 poll 45 all_up || fail "upstreams not all up+enabled: $(jq -c '[.upstreams[] | {slug, enabled, status, lastError}]' "$LAST")"
+
+# Tool permissions (ADR 008): members are read-only by default, and D2 has User A (a member)
+# create a product through chat, so A gets a per-user grant for woo__create_product (upsert, so
+# idempotent). HTTP 404 = a gateway without tool permissions (an older canary baseline): skip.
+code=$(jq -n --arg u "$A_ID" '{userId: $u, serverSlug: "woo", tool: "create_product", effect: "allow"}' |
+  api "$ADMIN_JAR" POST /api/permissions)
+case "$code" in
+  200) note "User A: per-user allow woo__create_product" ;;
+  404) note "gateway has no /api/permissions (no tool permissions): nothing to grant" ;;
+  *) fail "grant User A woo__create_product -> HTTP $code: $(err_of)" ;;
+esac
 
 # B's keys: revoke leftovers from earlier runs, then create this run's two keys.
 [ "$(api "$B_JAR" GET /api/keys)" = 200 ] || fail "list B's keys failed: $(err_of)"

@@ -1,0 +1,207 @@
+# Canary deploy of the gateway (#23, H2; docs/adr/003-canary.md). Ephemeral k3d inside the job via
+# Docker-in-Docker (ADR 000 Q9; proven by spike/k3d-dind): build images, install the stable release,
+# seed, deploy this commit as a 20 % canary, let scripts/canary/verdict.py decide, then promote or
+# roll back. All logic lives in scripts/canary/ci.sh. No external secrets: .env.local is generated.
+#
+# The job succeeds only on PROMOTE. ROLLBACK fails it ("RELEASE REJECTED: canary rolled back") and
+# so does HOLD. A PROMOTE of a high-risk change (RISK=high from risk:classify) is recorded as
+# PROMOTE_PENDING_APPROVAL and waits for a person at release:human-approval (#24). On the default
+# branch the job is not allow_failure, so a
+# rejected release fails main's pipeline, and `duo:incident` (#27,
+# .gitlab/ci/duo-dispatch.gitlab-ci.yml) opens the incident issue from verdict.json and assigns
+# it to the incident flow (.gitlab/flows/incident.yaml, trigger: Assign). On MRs it stays manual and
+# allow_failure, so a rejected canary never blocks review, except on `autoheal/` branches (#28,
+# docs/adr/005-self-healing.md): the incident flow's healer opens those MRs, and their canary runs
+# automatically and is not allow_failure, so the fix is verified with no human click and a fix
+# that does not hold fails its pipeline. Stable is the last promoted commit, the canary this one
+# (scripts/canary/ci.sh), hence GIT_DEPTH 0. `canary:bad-release` is the same job with
+# CANARY_FORCE_BAD=1: a 50 % tools/call error rate is injected into the canary, the verdict must be
+# ROLLBACK and the job then fails on purpose (a one-click, human-initiated drill; no CI variables
+# needed). The log carries one `CANARY_VERDICT_JSON: {...}` line. Artifacts: verdict.json, dotenv
+# VERDICT=... DECISION=...
+
+# Release risk class of this change (#24, H3): scripts/canary/risk.py diffs against the MR's merge
+# base (CI_MERGE_REQUEST_DIFF_BASE_SHA) or main's previous tip (CI_COMMIT_BEFORE_SHA; HEAD~1 when
+# the pipeline has no push range) and fails closed to high. dotenv RISK=high|low (+ RISK_PATHS) is
+# read by canary (later stage) and release:human-approval (needs).
+risk:classify:
+  stage: test
+  image: python:3.12-alpine
+  cache: []
+  interruptible: true
+  variables:
+    GIT_DEPTH: '0' # the merge base / previous tip must be in the clone
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  before_script:
+    - apk add --no-cache git
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+  script:
+    - python3 scripts/canary/risk.py --out risk.json --env risk.env
+  artifacts:
+    expire_in: 30 days
+    paths:
+      - risk.json
+    reports:
+      dotenv: risk.env
+
+# Unit tests of the canary/release scripts: verdict.py, record.jq, risk.py, approval.py.
+canary:unit-tests:
+  stage: test
+  image: python:3.12-alpine
+  cache: []
+  interruptible: true
+  before_script:
+    - apk add --no-cache git jq
+  script:
+    - python3 -m unittest discover -s scripts/canary -p 'test_*.py'
+
+canary:
+  stage: deploy
+  image: docker:27
+  services:
+    - name: docker:27-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ''
+    K3D_VERSION: v5.9.0
+    CANARY_FORCE_BAD: '0'
+    GIT_DEPTH: '0' # the stable baseline commit must be in the clone
+  cache: []
+  timeout: 45m
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^autoheal\//
+      allow_failure: false
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: manual
+      allow_failure: true
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      allow_failure: false
+  before_script:
+    - apk add --no-cache bash curl jq nodejs python3 openssl git kubectl helm
+    - curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG=$K3D_VERSION bash
+  script:
+    - export CANARY_KUBE_HOST=docker
+    - export CANARY_INGRESS_IP="$(getent hosts docker | awk '{print $1; exit}')"
+    - bash scripts/canary/ci.sh
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - verdict.json
+      - tests/e2e/.out/seed.log
+    reports:
+      dotenv: verdict.env
+
+# Forced bad release: same pipeline, the canary carries injected faults. Manual everywhere, so a
+# ROLLBACK lands in the pipeline history on demand (H4). It is allow_failure everywhere so it never
+# leaves main "blocked"; on main, `duo:incident:bad-release` still dispatches its incident (#27). To
+# fail main's pipeline on purpose (the incident drill), a person runs a pipeline on main from the
+# UI with variable CANARY_FORCE_BAD=1: the automatic `canary` job then rolls back and fails the
+# pipeline, and `duo:incident` dispatches the incident. ADR 004, ADR 007.
+canary:bad-release:
+  extends: canary
+  variables:
+    CANARY_FORCE_BAD: '1'
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: manual
+      allow_failure: true
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
+
+# Verdict of an autoheal MR's canary, readable by the postmortem flow (#28, #32,
+# .gitlab/flows/postmortem.yaml; docs/adr/005-self-healing.md). Duo flows cannot read job logs in
+# this project (#32), but they can read the MR description. scripts/canary/autoheal_report.py
+# prints verdict.json as one `AUTOHEAL_VERDICT_JSON: {...}` line and writes the same line into the
+# MR description between the visible lines `autoheal-verdict:start` and `autoheal-verdict:end`
+# (replaced on reruns), which the flow reads with get_merge_request. It then exits 1 on purpose:
+# get_pipeline_failing_jobs lists the job, which proves the pipeline reached the report, and
+# allow_failure keeps the pipeline green. It runs even when the canary failed (when: always), and
+# then reports that verdict, or decision NONE. Afterwards `duo:postmortem` (#33) mentions the
+# postmortem flow's account on the MR when the verdict is a PROMOTE. Token: CI/CD variable
+# DUO_DISPATCH_TOKEN (masked, as in .gitlab/ci/duo-dispatch.gitlab-ci.yml), read from the
+# environment only, never echoed or passed as an argument. Unset or an API error: one line in the
+# log, the description is unchanged.
+autoheal:report:
+  stage: deploy
+  image: python:3.12-alpine
+  cache: []
+  needs:
+    - job: canary
+      artifacts: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^autoheal\//
+      when: always
+      allow_failure: true
+  script:
+    - python3 scripts/canary/autoheal_report.py --verdict verdict.json
+
+# Human approval of a high-risk release (#24, H3). Manual and not allow_failure, so the pipeline
+# shows "blocked" until a person runs it; scripts/canary/approval.py records who (GITLAB_USER_LOGIN
+# = whoever clicked) and when in approval.json.
+#   default branch: created only when the push touches a high-risk path (same globs; a low-risk
+#     main pipeline stays green, never "blocked"); after a
+#     canary PROMOTE_PENDING_APPROVAL it approves the promotion, and with RISK=low it is a no-op
+#     ("low risk: no approval needed"). Skipped when canary failed (nothing to approve).
+#   MR pipelines: created only when the diff touches a high-risk path (same globs as risk.py,
+#     checked by .gitlab/flows/tests/flows.test.sh) and approves the merge; with "Pipelines must
+#     succeed" the MR cannot merge until someone does.
+release:human-approval:
+  stage: deploy
+  image: python:3.12-alpine
+  cache: []
+  needs:
+    - risk:classify
+    - canary
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - apps/gateway/src/auth/**/*
+        - apps/gateway/src/keys/**/*
+        - apps/gateway/src/users/**/*
+        - apps/gateway/src/crypto/**/*
+        - apps/gateway/src/http/**/*
+        - apps/gateway/src/mcp/**/*
+        - apps/gateway/src/upstreams/ssrf*
+        - charts/**/networkpolicy*.yaml
+        - charts/**/values*.yaml
+        - charts/**/rbac*
+        - charts/**/secret*
+        - .gitlab-ci.yml
+        - .gitlab/ci/**/*
+        - apps/gateway/src/core/call-tool.ts
+        - apps/gateway/src/core/limits.ts
+      needs:
+        - risk:classify
+      when: manual
+      allow_failure: false
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - apps/gateway/src/auth/**/*
+        - apps/gateway/src/keys/**/*
+        - apps/gateway/src/users/**/*
+        - apps/gateway/src/crypto/**/*
+        - apps/gateway/src/http/**/*
+        - apps/gateway/src/mcp/**/*
+        - apps/gateway/src/upstreams/ssrf*
+        - charts/**/networkpolicy*.yaml
+        - charts/**/values*.yaml
+        - charts/**/rbac*
+        - charts/**/secret*
+        - .gitlab-ci.yml
+        - .gitlab/ci/**/*
+        - apps/gateway/src/core/call-tool.ts
+        - apps/gateway/src/core/limits.ts
+      when: manual
+      allow_failure: false
+  script:
+    - python3 scripts/canary/approval.py --out approval.json
+  artifacts:
+    when: always
+    expire_in: 1 year
+    paths:
+      - approval.json

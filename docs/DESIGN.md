@@ -15,6 +15,7 @@ that implements it.
 | woo-mcp           | `apps/woo-mcp/src`               | Our WooCommerce MCP server: 5 tools over the WooCommerce REST API                                   |
 | server-everything | `apps/everything/Dockerfile`     | MCP reference server 2.0.0, in-cluster, the D7 target                                               |
 | GitLab MCP        | `https://gitlab.com/api/v4/mcp`  | Hosted third-party upstream, fine-grained PAT as bearer                                             |
+| hosted servers    | `apps/gateway/src/hosted`        | Admin-added container images the gateway runs in `urumi-hosted` and registers (ADR 014)             |
 | contracts         | `packages/contracts/src`, `sql/` | zod schemas shared by all of the above; SQL migration                                               |
 | chart             | `charts/platform`                | One Helm chart for every workload                                                                   |
 
@@ -96,7 +97,8 @@ and results only as `tool_result` blocks.
 
 ## 3. Data model
 
-`packages/contracts/sql/001_init.sql`, applied on gateway start by
+`packages/contracts/sql/001_init.sql` … `007_stores.sql` (one file per feature: tool permissions,
+scaling, observability, OAuth, hosted servers, stores), applied on gateway start by
 `apps/gateway/src/db/migrate.ts` (advisory lock, `schema_migrations` table, idempotent).
 
 ```mermaid
@@ -144,7 +146,7 @@ erDiagram
     text tool
     timestamptz started_at
     integer duration_ms
-    text outcome "ok | error | timeout | denied"
+    text outcome "ok | error | timeout | denied | rate_limited"
     text error_code
   }
 ```
@@ -152,6 +154,10 @@ erDiagram
 - A CHECK (`upstreams_credential_complete`) keeps the ciphertext, IV, tag and header-name columns
   consistent with `credential_type`.
 - `audit_log.server_slug` is plain text, so deleting an upstream keeps its audit history.
+- OAuth (ADR 013, `005_oauth.sql`): `oauth_clients` (DCR), `oauth_auth_requests` (pending
+  consent, 10 min), `oauth_grants` (one per approval = a connected app = a token family, with
+  `revoked_at` / `revoke_reason`), `oauth_codes` (60 s, single use), `oauth_tokens` (access /
+  refresh, sha256 only), and `audit_log.oauth_grant_id` (at most one of it and `api_key_id`).
 - The first admin is created from `SEED_ADMIN_EMAIL` / `SEED_ADMIN_PASSWORD` only when no admin
   exists (`apps/gateway/src/db/seed.ts`); it never updates an existing user.
 
@@ -202,6 +208,14 @@ Implemented in `packages/contracts/src/naming.ts`, applied in
   (`duplicate qualified tool name after sanitising`).
 - The chat service additionally skips any tool whose name fails Claude's regex or whose
   `inputSchema.type` is not `object` (`toAnthropicTools`).
+- **Reserved slug `gateway`** (ADR 012): the gateway's own meta-tools `gateway__search_tools` and
+  `gateway__call_tool`; an upstream cannot be created with it.
+- **Many tools: discovery mode** (ADR 012). `/mcp?mode=discovery` (or header
+  `x-urumi-tool-mode: discovery`) lists only the two meta-tools: a BM25 keyword search over the
+  caller's permitted tools, and a call that goes through `callTool` (permissions, timeout, audit
+  of the real tool). The chat agent switches to it when a user's permitted tools exceed
+  `CHAT_DISCOVERY_THRESHOLD` (default 40) and reports the real tools executed. D12 proves it on
+  142 tools.
 
 ## 6. Failure isolation (G4)
 
@@ -239,7 +253,7 @@ email and 30 failures per client IP per 15 min; a refusal looks exactly like a w
 and unknown emails cost one scrypt like real ones.
 
 **CSRF** (`apps/gateway/src/http/csrf.ts`). On every POST/PUT/PATCH/DELETE except the `/mcp`
-route: a body must be `application/json` (cross-origin browsers need a preflight for that, which
+route and the cookie-less OAuth endpoints `/oauth/register`, `/oauth/token`, `/oauth/revoke`: a body must be `application/json` (cross-origin browsers need a preflight for that, which
 is never granted) and a present `Origin` must equal `PUBLIC_ORIGIN`.
 
 **Roles.** `requireAdmin` guards upstream create/edit/delete, member management, and other users'
@@ -249,12 +263,52 @@ or disable themselves, and the last active admin cannot be removed (row-locked,
 `users/routes.ts`). There is no self-signup: admins create members and get a one-time
 `tempPassword` (16 random bytes).
 
+**Tool permissions** (ADR 008; `packages/contracts/src/permissions.ts`,
+`apps/gateway/src/permissions/`, `core/visible-tools.ts`). Rules in `tool_permissions`
+(role or user × server or `*` × tool / `prefix*` / `*` × allow/deny); a user's own rules override
+the role's, the most specific rule wins, deny wins ties, and no match means deny. Default: admins
+everything; members only read tools (`woo__list_products`, `woo__list_orders`, `woo__get_order`,
+everything's harmless tools, GitLab `get_*` / `list_*` / search). Every tool list (MCP
+`tools/list`, chat tool set, `/api/tools`, `/api/upstreams/:id/tools`) is filtered by
+`listToolsFor(userId)`, and `callTool` rejects a disallowed name with `FORBIDDEN` before touching
+the upstream, audited as `denied`. Admins edit rules at `/api/permissions` (dashboard
+**Permissions**, with an effective-access preview using the same evaluator). Proven by D9.
+
 **API keys** (`apps/gateway/src/auth/api-keys.ts`, `keys/`). `urk_` + base64url(32 random
 bytes), returned once by `POST /api/keys`. The DB keeps sha256 (`key_hash`, unique) and an 8-char
 `prefix` for display. Only the exact form `Bearer urk_<43 chars>` is looked up. A key is accepted
 only if not revoked and its user is not disabled. Revoking sets `revoked_at` (own keys, or any
 user's as admin); another user's key id answers 404. `last_used_at` is updated at most once a
 minute, fire-and-forget.
+
+**OAuth for MCP clients** (ADR 013; `apps/gateway/src/oauth/`, dashboard `Consent.tsx`,
+`ConnectedApps.tsx`). The gateway is also an OAuth 2.1 authorization server, so a client given
+only `http://app.localtest.me/mcp` can sign in through the browser instead of using a pasted key:
+
+```mermaid
+sequenceDiagram
+  participant C as MCP client
+  participant G as Gateway
+  participant B as Browser (dashboard)
+  C->>G: POST /mcp (no token)
+  G-->>C: 401 WWW-Authenticate: Bearer resource_metadata=".../.well-known/oauth-protected-resource/mcp"
+  C->>G: GET protected-resource + authorization-server metadata
+  C->>G: POST /oauth/register (DCR: name, loopback redirect)
+  C->>B: open /oauth/authorize?code_challenge(S256)&state&resource
+  B->>G: GET /oauth/authorize → 302 /consent?request=…
+  B->>G: (login if needed) GET /api/oauth/requests/:id → client name, redirect host, consent token
+  B->>G: POST /api/oauth/requests/:id {approve, consentToken} → redirectTo (code, state, iss)
+  B->>C: redirect to http://127.0.0.1:<port>/callback?code…
+  C->>G: POST /oauth/token (code + code_verifier) → access 1 h + refresh 30 d
+  C->>G: POST /mcp Bearer uat_… → same path as API keys (listToolsFor, callTool, audit)
+```
+
+Clients registered with DCR (https or loopback redirect URIs only, rate limited); codes single
+use, 60 s, bound to client + redirect + PKCE; refresh tokens rotate and reuse revokes the grant;
+tokens opaque and stored as sha256. `/mcp` accepts `urk_` API keys or `uat_` access tokens and
+both become a user id; the audit row records the OAuth grant (`authMethod: oauth`, client name).
+**Connected apps** lists grants (members: own; admins: all) and disconnecting deletes their
+tokens immediately. All state is in Postgres, so any replica serves any step.
 
 ## 8. Upstream credentials (G5)
 
@@ -282,18 +336,22 @@ minute, fire-and-forget.
 One `audit_log` row per `callTool` invocation, written before the caller gets the result
 (`core/call-tool.ts` → `audit/hook.ts` → `audit/repo.ts`).
 
-| Case                                                                   | `outcome` | `error_code`                                                 |
-| ---------------------------------------------------------------------- | --------- | ------------------------------------------------------------ |
-| Upstream returned a result                                             | `ok`      | null                                                         |
-| Upstream returned `isError: true`                                      | `error`   | `UPSTREAM_ERROR`                                             |
-| Upstream error, unreachable, result too large                          | `error`   | `UPSTREAM_ERROR` / `UPSTREAM_UNREACHABLE`                    |
-| 15 s deadline passed                                                   | `timeout` | `UPSTREAM_TIMEOUT`                                           |
-| Unknown tool / unqualified name, disabled server, non-object arguments | `denied`  | `TOOL_NOT_FOUND` / `UPSTREAM_DISABLED` / `VALIDATION_FAILED` |
-| Anything unexpected                                                    | `error`   | `INTERNAL`                                                   |
+| Case                                                                   | `outcome`      | `error_code`                                                 |
+| ---------------------------------------------------------------------- | -------------- | ------------------------------------------------------------ |
+| Upstream returned a result                                             | `ok`           | null                                                         |
+| Upstream returned `isError: true`                                      | `error`        | `UPSTREAM_ERROR`                                             |
+| Upstream error, unreachable, result too large                          | `error`        | `UPSTREAM_ERROR` / `UPSTREAM_UNREACHABLE`                    |
+| 15 s deadline passed                                                   | `timeout`      | `UPSTREAM_TIMEOUT`                                           |
+| Unknown tool / unqualified name, disabled server, non-object arguments | `denied`       | `TOOL_NOT_FOUND` / `UPSTREAM_DISABLED` / `VALIDATION_FAILED` |
+| Anything unexpected                                                    | `error`        | `INTERNAL`                                                   |
+| `/mcp` request over the per-key / per-user limit (ADR 010)             | `rate_limited` | `RATE_LIMITED` (server `gateway`, tool `mcp`)                |
 
 Each row has user, API key (MCP) or null (chat), source, server slug (`unknown` if the name did
 not parse), the upstream's original tool name (capped at 200 chars), start time, duration,
-outcome and error code.
+outcome, error code and **error detail** (ADR 011): the fixed-vocabulary reason — `Timed out`,
+`Host did not resolve`, `Connection failed (ECONNREFUSED)`, `HTTP 503`, `MCP error -32603`,
+`Tool returned an error`, `Not permitted`, … — classified for the API (`errorReason`) and the
+Health / Metrics page. Never upstream text.
 
 **Not logged:** tool arguments and results (customer data, ADR 001); `tools/list` calls;
 requests with a missing, revoked or unknown key (no user to attribute them to — they are a 401 in
@@ -312,12 +370,12 @@ and `values-prod.yaml` (README "Local → VPS").
 | Workload           | Kind                                        | Probes                                                                  | Notes                                                                                                  |
 | ------------------ | ------------------------------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
 | `urumi-mariadb`    | StatefulSet, PVC                            | liveness + readiness                                                    | official `mariadb` image                                                                               |
-| `urumi-wordpress`  | Deployment, PVC (whole docroot)             | liveness + readiness                                                    | official `wordpress` image; Ingress `store.<host>`                                                     |
+| `urumi-wordpress`  | Deployment, PVC (whole docroot)             | liveness + readiness                                                    | official `wordpress` image, non-root (uid 33); Ingress `store.<host>`                                  |
 | `urumi-bootstrap`  | Job (Helm `post-install,post-upgrade` hook) | — (Jobs exempt)                                                         | installs WP + WooCommerce (pinned version), COD, publishes `urumi-woo-api`, scales woo-mcp             |
 | `urumi-postgres`   | StatefulSet, PVC                            | liveness + readiness                                                    | NetworkPolicy: gateway pods only, TCP 5432                                                             |
 | `urumi-woo-mcp`    | Deployment                                  | `/healthz`                                                              | 0 replicas until `urumi-woo-api` exists (`lookup`); NetworkPolicy: gateway pods only, 8080; no Ingress |
 | `urumi-everything` | Deployment                                  | TCP                                                                     | NetworkPolicy: gateway pods only, 3001; no Ingress; read-only root FS                                  |
-| `urumi-gateway`    | Deployment                                  | startup + liveness `/healthz`, readiness `/readyz` (DB `SELECT 1`, 1 s) | Ingress `app.<host>` `/api`, `/mcp`                                                                    |
+| `urumi-gateway`    | Deployment, 2 replicas (local/prod), PDB    | startup + liveness `/healthz`, readiness `/readyz` (DB `SELECT 1`, 1 s) | Ingress `app.<host>` `/api`, `/mcp`; soft anti-affinity; `preStop` drain (ADR 010)                     |
 | `urumi-dashboard`  | Deployment                                  | liveness + readiness                                                    | Ingress `app.<host>` `/`                                                                               |
 
 - **Requests and limits** on every container (`values.yaml`); `tests/infra/chart-checks.sh`
@@ -330,30 +388,91 @@ and `values-prod.yaml` (README "Local → VPS").
   `urumi-woo-api` only; `create` on Secrets in the namespace (Kubernetes cannot scope `create` by
   name); `get/patch/update` on the `urumi-woo-mcp` Deployment and its scale. Only the Job's
   kubectl container gets a projected token.
-- **NetworkPolicies** exist for woo-mcp, server-everything and Postgres (ingress only). MariaDB,
-  WordPress, the gateway and the dashboard have none, and there is no egress policy. k3s's
-  embedded policy controller enforces them; `scripts/smoke-ingress.sh` and
-  `tests/infra/woo-mcp-netpol.sh` prove a non-gateway pod is blocked.
-- **SSRF allow-list**: `UPSTREAM_ALLOWED_HOSTS` defaults to `*.<namespace>.svc.cluster.local` so
-  in-cluster upstreams pass the private-address check.
+- **NetworkPolicies** (ADR 009, `templates/networkpolicy/`, `networkPolicy.enabled`, on in both
+  values files): a namespace-wide **default deny for ingress and egress**, DNS egress for every
+  pod, and one allow per real flow — Traefik → dashboard / gateway (+ canary) / WordPress;
+  gateway → Postgres, woo-mcp, everything, internet 80/443; woo-mcp → WordPress; WordPress →
+  MariaDB (+ internet); bootstrap Job → MariaDB, WordPress, Kubernetes API, internet. "Internet"
+  excludes private, CGNAT, link-local and loopback ranges. Postgres, MariaDB, everything and the
+  dashboard have no egress. k3s's kube-router enforces them; `tests/infra/netpol-default-deny.sh`
+  proves an unlabelled pod reaches nothing and a gateway-labelled pod reaches only its three
+  backends (output in `docs/NETWORK_POLICIES.md`); `tests/infra/chart-checks.sh` fails if a
+  workload has no allow policy.
+- **Non-root**: every long-running container runs as a non-root uid. WordPress runs as www-data
+  (33) with all capabilities dropped and binds port 80 through the safe pod sysctl
+  `net.ipv4.ip_unprivileged_port_start=0` (`wordpress.runAsNonRoot`, ADR 009).
+- **Several gateway replicas** (ADR 010, `gateway.replicas`): any replica serves any request —
+  `/mcp` is stateless Streamable HTTP, and what replicas must agree on lives in Postgres: the `/mcp`
+  token buckets (`rate_limit_buckets`, per key and per user, one atomic UPSERT per bucket, 429 +
+  `Retry-After`, audited `rate_limited`) and the `health` lease (`gateway_leases`): only the
+  holder runs the 15 s health loop and writes upstream status; followers read status from the
+  row. Tool caches stay per replica (correctness comes from the row). D10 proves it on k3d.
+- **Metrics** (ADR 011): each gateway pod serves Prometheus `GET /metrics` on internal port 9464
+  (`tool_calls_total`, `tool_call_duration_seconds`, `upstream_up`, last-check/last-success
+  timestamps, `rate_limited_total`, process metrics), exposed by Service
+  `<release>-gateway-metrics` only — never by the Ingress — and admitted by NetworkPolicy only
+  from pods labelled `urumi.io/metrics-scraper: "true"`. Per pod; sum over pods. Optional
+  `ServiceMonitor` (off). The admin **Health / Metrics** page computes per-server calls, error
+  rate and p50/p95 from `audit_log` (all replicas) and shows each upstream's classified last
+  failure and last success.
+- **Hosted MCP servers** (ADR 014, `templates/hosted/`, `hosted.enabled`, on in both values
+  files): admins add an MCP server by container image (`POST /api/hosted-servers` or the
+  dashboard's "Hosted (container image)" mode). The gateway's reconciler (`hosted/reconciler.ts`,
+  under the Postgres lease `hosted`, so one writer across replicas) server-side-applies a
+  Deployment, ClusterIP Service and optional env Secret `mcp-<slug>[-env]` in namespace
+  `urumi-hosted`, from a pod template fixed in `hosted/manifests.ts` (non-root uid 65532,
+  read-only root + `/tmp` emptyDir, no capabilities, seccomp RuntimeDefault, no SA token, preset
+  requests/limits, TCP probes). When the pod is ready it enables the hosted upstream row
+  (`http://mcp-<slug>.urumi-hosted.svc.cluster.local:<port><path>`) and checks it at once; status
+  Deploying / Connected / Unreachable / Failed (with the pod's reason) is shown on the Upstreams
+  page. The namespace enforces Pod Security `restricted`, a ResourceQuota + LimitRange, default
+  deny with ingress only from the gateway, DNS egress, and internet egress only for servers created
+  with `egress: true`. Images must match `hosted.allowedImages` (prefixes); digests are recorded
+  and can be required (`hosted.requireDigest`, on in prod). The gateway's ServiceAccount has one
+  Role, in `urumi-hosted`: deployments get/list/create/patch/delete, services and secrets
+  create/patch/delete (no secret reads), pods get/list — checked by `tests/infra/hosted-chart.sh`.
+  The gateway talks to the API with `node:https` + its projected token (no client library).
+- **Multiple stores** (ADR 015, `templates/stores/`, `multiStore.enabled`, on in
+  `values-local.yaml`, off in `values-prod.yaml`): admins create and delete extra WooCommerce
+  stores on the **Stores** page (`POST /api/stores`: slug, name, admin email). The gateway's
+  provisioner (`stores/provisioner.ts`, Postgres lease `stores`) creates namespace `store-<slug>`
+  (Pod Security `restricted`, ResourceQuota + LimitRange, default-deny NetworkPolicies with only
+  the store's own flows), MariaDB + WordPress with their PVCs, an Ingress for
+  `<slug>.<multiStore.domainSuffix>`, generated passwords in create-once Secrets, the built-in
+  store's bootstrap Job (same scripts, mounted into the gateway from the bootstrap ConfigMap), and
+  — after the Job succeeded — a woo-mcp Deployment with its own shared secret. It then enables the
+  store's upstream row (`http://woo-mcp.store-<slug>.svc.cluster.local/mcp`, tools `<slug>__*`)
+  with the built-in store's member read-only defaults. Status Provisioning (with the step) / Ready
+  / Failed (with the reason; Retry) / Deleting. Delete removes the namespace (volumes included),
+  then the rules and the upstream. RBAC: a ClusterRole for namespaces + creating RoleBindings that
+  may only reference two chart-defined ClusterRoles (`bind` by name), confined to `store-*`
+  namespaces by a ValidatingAdmissionPolicy; checked by `tests/infra/stores-chart.sh`, proved by
+  D15. Stores are runtime objects: Helm upgrades and rollbacks do not touch them (ADR 015).
+- **SSRF allow-list**: `UPSTREAM_ALLOWED_HOSTS` defaults to exactly the chart's in-cluster
+  upstream Services (`<release>-woo-mcp` and `<release>-everything` in the namespace,
+  `templates/gateway/_pod.tpl`), so they pass the private-address check while Postgres, MariaDB
+  and WordPress stay blocked. Hosted and store upstream rows may reach only their own computed
+  Service host.
 
 ## 11. Tradeoffs and what we would do with more time
 
-| Decision                              | Gained                                             | Cost / next step                                                                                                               |
-| ------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| Stateless `/mcp`, no sessions         | Key re-checked on every request; no sticky routing | No `tools/list_changed` push; clients re-list to see D6                                                                        |
-| New upstream connection per operation | Simple, no shared state, isolation per call        | Extra `initialize` round trip per call; sessions are closed without `DELETE` (see below)                                       |
-| In-memory caches and rate limits      | No Redis                                           | Per replica, reset on restart; one gateway replica is assumed                                                                  |
-| All tools visible to every user       | Simple role model                                  | Per-tool / per-upstream permissions (O3, not planned) — today a member can call write tools such as `woo__update_order_status` |
-| Request/response chat                 | Simple, stateless                                  | No streaming; long tool loops show nothing until done                                                                          |
-| Metadata-only audit                   | No second store of customer data                   | Cannot replay what a tool was asked; admin actions are not audited                                                             |
-| Static bearer for GitLab              | No OAuth flow in the gateway                       | Token expiry is manual rotation (update Secret, re-run seed)                                                                   |
+| Decision                              | Gained                                                | Cost / next step                                                                         |
+| ------------------------------------- | ----------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Stateless `/mcp`, no sessions         | Key re-checked on every request; no sticky routing    | No `tools/list_changed` push; clients re-list to see D6                                  |
+| New upstream connection per operation | Simple, no shared state, isolation per call           | Extra `initialize` round trip per call; sessions are closed without `DELETE` (see below) |
+| Shared state in Postgres, not Redis   | No new stateful dependency; replicas agree (ADR 010)  | Two small UPSERTs per `/mcp` POST; chat limit and login throttle still per replica       |
+| Per-tool permissions read per request | A rule change applies on the next call; one code path | One small policy query per `tools/list` / `tools/call` (ADR 008); no per-API-key scopes  |
+| Request/response chat                 | Simple, stateless                                     | No streaming; long tool loops show nothing until done                                    |
+| Metadata-only audit                   | No second store of customer data                      | Cannot replay what a tool was asked; admin actions are not audited                       |
+| Static bearer for GitLab              | No OAuth flow in the gateway                          | Token expiry is manual rotation (update Secret, re-run seed)                             |
+| Hosted servers: allow-list + digest   | No admission controller to install; works on any k3s  | No image signature check (cosign) or scan; egress is all-or-nothing internet (ADR 014)   |
 
 With more time: terminate upstream MCP sessions (`DELETE`) after each operation; stream-cap
-response bodies before parsing; audit admin actions; per-key rate limits on `/mcp`; egress
-NetworkPolicy for the gateway; append-only audit role in Postgres; per-tool permissions;
-confirmation step for write tools in chat; KMS-backed or rotatable `GATEWAY_ENC_KEY`; image
-build + e2e in CI; a real VPS run (#25).
+response bodies before parsing; audit admin actions; move the chat limit and login throttle to
+the shared token buckets;
+append-only audit role in Postgres; per-API-key scopes;
+confirmation step for write tools in chat; KMS-backed or rotatable `GATEWAY_ENC_KEY`; the
+e2e flows in CI (images are already built and pushed by CI); a real VPS run (#25).
 
 **Known gap: upstream sessions are not terminated.** ADR 002 measured that server-everything
 keeps every un-terminated session in memory (≈ 0.06 MiB each) and expected the fix in the
@@ -361,3 +480,56 @@ gateway client. `apps/gateway/src/mcp-client/upstream-client.ts` still calls onl
 `client.close()`, never `transport.terminateSession()`. With one health ping per 15 s plus calls,
 the `everything` pod grows toward its 192 Mi limit (ADR 002 estimates an OOM kill about every 10
 hours); Kubernetes restarts it and the health loop reports the gap.
+
+## 12. Upgrades and rollback
+
+One Helm release (`urumi`) holds every component, so every change — image, values, chart — is one
+numbered revision (`helm history`). The same commands work locally and on a VPS; only the values
+file differs.
+
+**Upgrade.** `helm upgrade --install urumi charts/platform -n urumi -f <values> --wait`. What
+happens per component:
+
+| Component                                               | On upgrade                                                                                                                             | On `helm rollback <rev>`                                                      |
+| ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| gateway, dashboard, woo-mcp, everything                 | Deployment rolling update (new pod Ready before the old one goes)                                                                      | same rolling update back to the old pod template                              |
+| WordPress                                               | `Recreate` (the docroot PVC is ReadWriteOnce): a few seconds without a storefront                                                      | same                                                                          |
+| MariaDB, Postgres                                       | StatefulSet rolling update of pod 0; data stays on the `volumeClaimTemplates` PVC                                                      | pod spec only; **data is not rolled back**                                    |
+| WordPress docroot PVC                                   | unchanged (`helm.sh/resource-policy: keep`, also survives `helm uninstall`)                                                            | unchanged                                                                     |
+| Gateway schema                                          | new `packages/contracts/sql/NNN_*.sql` files applied on start, once, under a Postgres advisory lock (`apps/gateway/src/db/migrate.ts`) | **not reverted** (no down-migrations): the old image runs on the newer schema |
+| Store bootstrap (Job, `post-install,post-upgrade` hook) | re-runs after every install/upgrade; idempotent: checks state first, keeps a still-working Application Password, re-scales woo-mcp     | **does not run** (no `post-rollback` hook); the store keeps its state         |
+| Secrets `urumi-env`, `urumi-woo-api`                    | never rendered by the chart; untouched                                                                                                 | untouched                                                                     |
+| NetworkPolicies, RBAC, Ingress                          | created/updated/deleted to match the chart                                                                                             | restored to the old revision's set (verified: README "Upgrades and rollback") |
+| Store namespaces `store-<slug>` (ADR 015)               | not Helm objects: untouched by the upgrade; the new gateway re-applies objects whose spec hash changed (e.g. a new woo-mcp image)      | untouched; without `multiStore` in the old revision they run unmanaged        |
+
+**Rules that keep rollback safe.**
+
+1. Migrations are additive (expand, then contract in a later release): add tables/columns with
+   defaults, never drop or rename what the previous release reads. Then rolling the gateway back
+   one revision is always safe; data written by the newer release is ignored, not lost.
+2. The hook must stay idempotent and must not depend on running after a rollback.
+3. Immutable fields — StatefulSet `volumeClaimTemplates` (storage size, class) and every
+   `selector` — cannot change through `helm upgrade`. A PVC is resized with `kubectl patch pvc`
+   on a StorageClass with `allowVolumeExpansion`; a selector change needs a new object name.
+4. A failed upgrade (`--wait` timeout or failed hook) leaves the revision `failed`; recover with
+   `helm rollback urumi <last deployed rev>` after reading `kubectl get events` and the failing pod's
+   logs. `--atomic` would do this automatically but also hides the failed state, so it is not the
+   default here.
+5. Back up before risky upgrades: `kubectl -n urumi exec urumi-postgres-0 -- pg_dump -U gateway
+gateway > gateway.sql` and `kubectl -n urumi exec urumi-mariadb-0 -- mariadb-dump …`. Restores
+   are manual; there is no scheduled backup in the chart.
+
+**Automated rollback of gateway releases (CI canary, ADR 003/005).** On `main`, the `canary` job
+builds a throwaway k3d cluster, installs the last promoted commit as stable, seeds users and
+today's orders, then deploys the new gateway image as `urumi-gateway-canary` with 20 % of `/api`
+and `/mcp` (Traefik `IngressRoute`). `scripts/canary/verdict.py` sends real `woo__list_orders`
+calls with a member's key and compares the tracks (error rate, p95 latency, tool success):
+
+- **PROMOTE** → `scripts/canary/run.sh promote <tag>`: the stable image becomes the canary's tag
+  and the canary is disabled (a Helm upgrade with `--reset-then-reuse-values --no-hooks`).
+- **ROLLBACK** or **HOLD** → `scripts/canary/run.sh rollback`: the canary is disabled, stable is
+  untouched; the job fails, which opens an incident and starts the Duo incident flow (ADR 007).
+- A PROMOTE of a high-risk change is rolled back and waits for `release:human-approval`.
+
+The canary only exercises the gateway; chart-wide changes (NetworkPolicies, StatefulSets) are
+verified by the e2e suite on the local cluster and rolled back with `helm rollback`.

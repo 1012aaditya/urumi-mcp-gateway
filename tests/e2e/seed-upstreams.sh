@@ -10,7 +10,7 @@
 #   RELEASE     Helm release name, default urumi
 #   ENV_SECRET  Secret with the credentials, default urumi-env
 #   GITLAB_MCP_URL  default https://gitlab.com/api/v4/mcp
-#   E2E_SKIP_GITLAB 1 = skip the gitlab upstream (no GITLAB_MCP_TOKEN)
+#   E2E_SKIP_GITLAB 1 = skip the gitlab upstream (no GITLAB_MCP_TOKEN, e.g. the CI canary job)
 #   tests/e2e/seed-upstreams.sh
 set -euo pipefail
 set +x

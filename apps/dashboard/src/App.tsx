@@ -1,15 +1,20 @@
 import { QueryClient, QueryClientProvider, useQueryClient } from '@tanstack/react-query';
-import { useEffect, useState, type ReactNode } from 'react';
-import { BrowserRouter, Navigate, Route, Routes, useNavigate } from 'react-router';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router';
 import { ApiError, setUnauthorizedHandler } from './api.js';
-import { RequireAdmin, RequireAuth } from './auth.js';
+import { RequireAdmin, RequireAuth, safeNext } from './auth.js';
 import { Layout } from './components/Layout.js';
 import { Audit } from './pages/Audit.js';
 import { ChangePassword } from './pages/ChangePassword.js';
 import { Chat } from './pages/Chat.js';
+import { ConnectedApps } from './pages/ConnectedApps.js';
+import { Consent } from './pages/Consent.js';
 import { Keys } from './pages/Keys.js';
 import { Login } from './pages/Login.js';
+import { Health } from './pages/Health.js';
 import { Members } from './pages/Members.js';
+import { Permissions } from './pages/Permissions.js';
+import { Stores } from './pages/Stores.js';
 import { Tools } from './pages/Tools.js';
 import { Upstreams } from './pages/Upstreams.js';
 
@@ -32,11 +37,16 @@ export function Providers({ client, children }: { client: QueryClient; children:
 /** On any 401: drop every cached response and go to the login page. */
 function UnauthorizedRedirect() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const here = useRef('');
+  here.current = location.pathname + location.search;
   const client = useQueryClient();
   useEffect(() => {
     setUnauthorizedHandler(() => {
       client.clear();
-      navigate('/login', { replace: true });
+      // Signed out on the OAuth consent page: come back to it after login (ADR 013).
+      const next = safeNext(here.current);
+      navigate(next ? `/login?next=${encodeURIComponent(next)}` : '/login', { replace: true });
     });
   }, [client, navigate]);
   return null;
@@ -49,6 +59,14 @@ export function AppRoutes() {
       <Routes>
         <Route path="/login" element={<Login />} />
         <Route
+          path="/consent"
+          element={
+            <RequireAuth>
+              <Consent />
+            </RequireAuth>
+          }
+        />
+        <Route
           element={
             <RequireAuth>
               <Layout />
@@ -59,6 +77,7 @@ export function AppRoutes() {
           <Route path="upstreams" element={<Upstreams />} />
           <Route path="tools" element={<Tools />} />
           <Route path="keys" element={<Keys />} />
+          <Route path="connected-apps" element={<ConnectedApps />} />
           <Route path="audit" element={<Audit />} />
           <Route path="chat" element={<Chat />} />
           <Route path="password" element={<ChangePassword />} />
@@ -67,6 +86,30 @@ export function AppRoutes() {
             element={
               <RequireAdmin>
                 <Members />
+              </RequireAdmin>
+            }
+          />
+          <Route
+            path="health"
+            element={
+              <RequireAdmin>
+                <Health />
+              </RequireAdmin>
+            }
+          />
+          <Route
+            path="stores"
+            element={
+              <RequireAdmin>
+                <Stores />
+              </RequireAdmin>
+            }
+          />
+          <Route
+            path="permissions"
+            element={
+              <RequireAdmin>
+                <Permissions />
               </RequireAdmin>
             }
           />

@@ -1,6 +1,6 @@
 {{- if and .Values.wooMcp.enabled .Values.wooMcp.networkPolicy.enabled }}
 {{- $ctx := dict "ctx" $ "component" "woo-mcp" }}
-# Only this release's gateway pods may open connections to
+# Only this release's gateway pods (stable, plus the canary while enabled) may open connections to
 # woo-mcp (K5): it holds the store's Application Password, so nothing else in the cluster may call
 # its tools directly.
 apiVersion: networking.k8s.io/v1

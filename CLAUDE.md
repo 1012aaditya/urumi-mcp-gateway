@@ -11,8 +11,8 @@ apps/dashboard/      React + Vite admin/member UI and chat panel
 packages/contracts/  Shared types: gateway API, DB schema, tool naming, error envelope
 charts/platform/     The one Helm chart; values-local.yaml, values-prod.yaml
 tests/e2e/           D1–D8 scripted flows (run.sh <step|all>)
-scripts/             cluster-up.sh, build-images.sh, gen-env.sh, dev-setup.sh
-docs/                REQUIREMENTS, DESIGN, THREAT_MODEL, adr/
+scripts/             cluster-up.sh, gitlab-setup.sh, create-issues.sh, dev-setup.sh
+docs/                REQUIREMENTS, PLAN, DESIGN, THREAT_MODEL, adr/
 ```
 
 ## Stack (locked — do not change without an ADR approved by Aadi)

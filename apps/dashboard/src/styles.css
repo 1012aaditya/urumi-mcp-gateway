@@ -387,7 +387,21 @@ tr.revoked td {
   color: var(--danger);
 }
 
-.badge-timeout {
+.badge-hosted-connected {
+  background: #dcf5e4;
+  color: var(--ok);
+}
+
+.badge-hosted-failed,
+.badge-hosted-unreachable {
+  background: #fde4e1;
+  color: var(--danger);
+}
+
+.badge-hosted-deploying,
+.badge-hosted-deleting,
+.badge-timeout,
+.badge-rate_limited {
   background: #fdf1d3;
   color: var(--warn);
 }
@@ -516,4 +530,60 @@ tr.revoked td {
 
 .composer textarea {
   resize: vertical;
+}
+
+/* Permissions page: effective-access preview. */
+.tool-access {
+  list-style: none;
+  padding: 0;
+  columns: 2;
+}
+.tool-access li {
+  margin: 0.15rem 0;
+}
+
+/* ── Health / Metrics ──────────────────────────────────────────────────── */
+.health-table td {
+  vertical-align: top;
+}
+
+ul.plain {
+  margin: 0;
+  padding-left: 1em;
+}
+
+.badge-disabled,
+.badge-unknown {
+  background: #eceff3;
+  color: var(--muted);
+}
+
+/* ── Chat: discovery mode (ADR 012) ────────────────────────────────────── */
+.discovery-note {
+  margin-bottom: 0.4em;
+  font-size: 0.9em;
+}
+
+.discovery-note ul {
+  margin: 0.2em 0 0;
+  padding-left: 1.2em;
+}
+
+.tools-used .via {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+/* OAuth consent (ADR 013) */
+.card.consent {
+  width: min(480px, 92vw);
+}
+
+.card.consent ul {
+  padding-left: 1.1rem;
+}
+
+.card.consent .actions {
+  display: flex;
+  gap: 0.75rem;
 }

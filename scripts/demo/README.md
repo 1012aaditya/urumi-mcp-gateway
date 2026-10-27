@@ -1,0 +1,90 @@
+# Self-healing demo (#28)
+
+The whole loop, end to end: a bad merge, canary ROLLBACK, an incident, an autoheal MR, an automatic
+canary PROMOTE, the postmortem, a human merge, and the automatic close. Design: [ADR 005](../../docs/adr/005-self-healing.md).
+Flows must be registered and enabled first, and the CI variable `DUO_DISPATCH_TOKEN` must be set
+(docs/HACKATHON.md, "Register the flows"; [ADR 007](../../docs/adr/007-duo-dispatch.md)). CI
+assigns the incident to the incident bot and, after the fix's canary PROMOTEs, mentions the
+postmortem bot (`duo:postmortem`, #33). The only human step is the merge.
+
+## 0. Check the regression offline (optional, 2 min)
+
+```bash
+node scripts/demo/check-regression.mjs        # PASS: 20 of 24 orders, ~9 KB through callTool
+bash scripts/demo/regression.sh --verify      # builds the demo branch, runs the gateway unit
+                                              # tests there (pass) and the check (FAIL)
+```
+
+`regression.sh` (without `--verify`) creates branch `demo/faster-tool-results` in the worktree
+`.hermes/demo-faster-tool-results`. The branch holds one commit, "perf(gateway): cap paginated
+tool results at 4 KB so pages stay fast". It never pushes, and it prints the push and MR commands.
+
+## 1. The bad merge (a person)
+
+```bash
+bash scripts/demo/regression.sh
+git -C .hermes/demo-faster-tool-results push -u origin demo/faster-tool-results
+cd .hermes/demo-faster-tool-results && glab mr create --source-branch demo/faster-tool-results \
+  --target-branch main --title "perf(gateway): cap paginated tool results at 4 KB so pages stay fast" \
+  --description "Smaller pages come back faster. Unit tests pass." --yes
+```
+
+The MR pipeline is green: `test` passes, and the change is in `apps/gateway/src/core/`, which is
+low risk. Its canary is manual, so leave it. **Merge** the MR. The merge starts main's pipeline.
+
+## 2. Canary ROLLBACK → incident (automatic, ~15 min)
+
+- main's `canary` builds stable from the last promoted commit and the canary from the merge. It
+  seeds 24 orders for today and probes `woo__list_orders`.
+- Log: `stable gateway = <old> (last-promoted), canary = <new>`, then
+  `CANARY VERDICT: ROLLBACK`, reason `canary woo__list_orders success 0.0% vs minimum 95.0%`,
+  then `RELEASE REJECTED: canary rolled back`. The pipeline **fails**.
+- `duo:incident` opens `Incident: canary rolled back <sha> (pipeline <id>)` with the canary
+  record and assigns it to `ai-canary-incident-gitlab-ai-hackathon`. The **Canary incident**
+  session posts `## Incident triage (Duo)` on it, opens
+  `Regression: gateway canary rejected at <sha> on main`, and answers `healable`.
+
+## 3. Healer → autoheal MR (automatic, same session)
+
+- `healer` lists the commits since the previous main tip and picks the one gateway commit. It
+  matches the hunk `if (resultBytes > maxBytes)` with `MAX_PAGE_RESULT_BYTES = 4 * 1024` against
+  "success 0 % with 2xx answers", and reverts those hunks in `limits.ts` and `call-tool.ts`.
+- It opens MR **`Autoheal: 4 KB page cap rejects normal list_orders pages (incident #N)`** from
+  `autoheal/<pipeline id>`, labelled `autoheal`. The MR has the root-cause analysis, the verdict
+  table, the hunk and the confidence. The incident and the regression issue each get a note
+  linking the MR.
+- If it is not sure, or the suspect touched CI, charts or secrets, there is no MR. Instead both
+  issues get a note "Autoheal: needs human." with its analysis.
+
+## 4. Automatic canary on the autoheal MR (~15 min, no click)
+
+- The MR pipeline runs `canary` automatically (autoheal rule): stable is the last promoted
+  commit, the canary is the fix, and the result is **PROMOTE**.
+- `autoheal:report` then shows as failed (allowed to fail; it fails on purpose). Its log has
+  `AUTOHEAL_VERDICT_JSON: {"decision":"PROMOTE",...}`. The pipeline passes with warnings.
+
+## 5. Postmortem (automatic)
+
+- After `autoheal:report`, the job `duo:postmortem` comments
+  `@ai-canary-postmortem-gitlab-ai-hackathon !<mr iid>: the canary verified this fix ...` on the
+  MR. (If GitLab does not start the flow on a bot's mention, post that comment yourself.) The
+  **Autoheal postmortem** session reads the verdict block for the MR's head pipeline.
+  On PROMOTE it:
+  - posts `## Postmortem (autoheal)` on the incident (impact, detection minutes, time to fix,
+    root cause, fix, what limited impact, action items);
+  - adds the label `status::mitigated`;
+  - notes on the MR: "Verified by canary (PROMOTE, pipeline N), ready to merge ...".
+- If the canary did not PROMOTE, it notes "fix not verified" on the MR and the incident instead.
+
+## 6. Merge (a person)
+
+**Merge** the autoheal MR. main's canary promotes the fix, and `duo:release-close` (#34) posts
+"Released and verified" on the incident, closes it (`status::resolved`) and closes the regression
+issue.
+
+## Reset
+
+```bash
+git -C . worktree remove --force .hermes/demo-faster-tool-results
+git branch -D demo/faster-tool-results
+```

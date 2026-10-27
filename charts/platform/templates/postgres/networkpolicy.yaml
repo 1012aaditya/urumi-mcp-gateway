@@ -1,6 +1,6 @@
 {{- if and .Values.postgres.enabled .Values.postgres.networkPolicy.enabled }}
 {{- $ctx := dict "ctx" $ "component" "postgres" }}
-# Only this release's gateway pods may open connections to
+# Only this release's gateway pods (stable, plus the canary while enabled) may open connections to
 # Postgres (holds users, key hashes, encrypted credentials).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

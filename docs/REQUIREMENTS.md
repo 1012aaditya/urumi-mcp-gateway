@@ -1,7 +1,7 @@
 # Requirements
 
-Single source of requirement IDs for the Urumi MCP Gateway.
-Source: the Urumi FDE assignment (analysed in `docs/ASSIGNMENT_ANALYSIS.md`).
+Single source of requirement IDs for the Urumi MCP Gateway and the GitLab Transcend entry.
+Source: the Urumi FDE assignment (analysed in `docs/ASSIGNMENT_ANALYSIS.md`) and the hackathon brief.
 Every issue, MR, test, and e2e step refers to these IDs.
 
 **Status legend:** ☐ not started · ◐ in progress · ☑ verified (evidence linked in the closing MR)
@@ -84,15 +84,24 @@ Each flow is one script `tests/e2e/dN-*.sh`, printing `PASS Dn` / `FAIL Dn: <rea
 | R5  | Demo video (recorded by Aadi) covering D1–D8, K8s setup, MCP internals, security, local→VPS              | 26 Oct       |
 | R6  | Submission form with video + public repo link                                                            | Aadi, 27 Oct |
 
-## 8. Optional (O) — not started before #21
+## 8. Hackathon layer (H) — only after #21 passes
 
-| ID  | Item                                     | Issue       |
-| --- | ---------------------------------------- | ----------- |
-| O1  | Live VPS deployment with the same chart  | #25         |
-| O2  | Multi-store provisioning                 | not planned |
-| O3  | Per-tool permissions, OAuth, rate limits | not planned |
+| ID  | Requirement                                                                                                      | Acceptance test                                                                                                                                                | Issue   |
+| --- | ---------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| H1  | Pipeline builds images to GitLab registry, packages the chart, runs Secret Detection, SAST, IaC, container scans | Main pipeline green with tagged images + versioned chart; scan reports visible                                                                                 | #22     |
+| H2  | Canary deploy of the gateway + verdict from business health                                                      | `verdict.py` emits PROMOTE / ROLLBACK / HOLD from error rate, latency, and `woo__list_orders` success; a forced bad release rolls back                         | #23     |
+| H3  | Duo Agent Platform flows: Verdict, Incident, risk gate                                                           | Forced rollback opens an incident + `priority::high` regression issue; an auth/gateway MR pauses for Human Input before promote; flow YAML in `.gitlab/flows/` | #24     |
+| H4  | Public project with visible pipeline history                                                                     | Project public; history shows ≥ 1 PROMOTE and ≥ 1 ROLLBACK                                                                                                     | #22–#24 |
 
-## 9. Fixed conventions (decided; change only via ADR)
+## 9. Optional (O) — not started before #21
+
+| ID  | Item                                     | Issue                                                                                                |
+| --- | ---------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| O1  | Live VPS deployment with the same chart  | #25                                                                                                  |
+| O2  | Multi-store provisioning                 | done: ADR 015, e2e D15                                                                               |
+| O3  | Per-tool permissions, OAuth, rate limits | per-tool permissions: ADR 008, e2e D9; OAuth: ADR 013, e2e D13; `/mcp` rate limits: ADR 010, e2e D10 |
+
+## 10. Fixed conventions (decided; change only via ADR)
 
 - "Today" = calendar day in the store timezone **Asia/Kolkata**, filtered by order `date_created`; bootstrap sets the WordPress timezone to match.
 - Qualified tool names `{server_slug}__{tool}`; slug `^[a-z0-9-]{1,20}$`, immutable; full name ≤ 64 chars (Claude tool-name limit).

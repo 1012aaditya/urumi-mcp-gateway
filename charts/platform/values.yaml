@@ -40,7 +40,7 @@ app:
 dashboard:
   enabled: false
   image:
-    repository: ghcr.io/<owner>/urumi-mcp-gateway/dashboard
+    repository: registry.gitlab.com/<group>/<project>/dashboard
     # Empty = the chart's appVersion.
     tag: ''
     pullPolicy: IfNotPresent
@@ -82,6 +82,10 @@ wordpress:
     repository: wordpress
     tag: 6-php8.3-apache
     pullPolicy: IfNotPresent
+  # Run Apache as www-data (33) from the start, all capabilities dropped; port 80 via the
+  # net.ipv4.ip_unprivileged_port_start=0 pod sysctl. false = the image's root start (it binds 80
+  # as root, then Apache drops to www-data).
+  runAsNonRoot: true
   # DB host:port. Empty = the chart's MariaDB Service on 3306.
   databaseHost: ''
   persistence:
@@ -187,7 +191,7 @@ wooMcp:
   networkPolicy:
     enabled: true
   image:
-    repository: ghcr.io/<owner>/urumi-mcp-gateway/woo-mcp
+    repository: registry.gitlab.com/<group>/<project>/woo-mcp
     # Empty = the chart's appVersion.
     tag: ''
     pullPolicy: IfNotPresent
@@ -215,7 +219,7 @@ everything:
   networkPolicy:
     enabled: true
   image:
-    repository: ghcr.io/<owner>/urumi-mcp-gateway/everything
+    repository: registry.gitlab.com/<group>/<project>/everything
     # Empty = the chart's appVersion.
     tag: ''
     pullPolicy: IfNotPresent
@@ -230,13 +234,50 @@ everything:
 # MCP gateway + admin API. Runs migrations and seeds the first admin on start.
 gateway:
   enabled: true
+  # Replicas of the stable gateway (ADR 010). Any replica serves any request: /mcp is stateless
+  # Streamable HTTP, sessions/rate limits/health status live in Postgres. values-local.yaml and
+  # values-prod.yaml run 2. With more than one, a PodDisruptionBudget keeps one pod up during node
+  # drains, and a soft anti-affinity / topology spread puts replicas on different nodes when it can.
+  replicas: 1
+  podDisruptionBudget:
+    # Applied only when replicas > 1.
+    minAvailable: 1
+  # Seconds a terminating pod keeps serving before SIGTERM, so the Ingress drops it from its
+  # endpoints first and no request is sent to a closed socket during a rollout or pod kill.
+  preStopSleepSeconds: 5
+  # Prometheus metrics (ADR 011): GET /metrics on this container port of every gateway pod. It is
+  # NOT on the gateway Service the Ingress uses; a separate ClusterIP Service `<release>-gateway-
+  # metrics` exposes it, and NetworkPolicy admits only pods labelled `scraperLabel` in this
+  # namespace (and, if set, pods in `scraperNamespace`). Metrics are per pod: sum over pods.
+  metrics:
+    enabled: true
+    port: 9464
+    # Label a scraper pod (Prometheus, an e2e check) needs to reach the port.
+    scraperLabel:
+      urumi.io/metrics-scraper: 'true'
+    # Namespace of an external Prometheus (e.g. monitoring); empty = none.
+    scraperNamespace: ''
+    # prometheus-operator ServiceMonitor. Off: no operator is installed by this chart.
+    serviceMonitor:
+      enabled: false
+      interval: 30s
+  # /mcp rate limits (ADR 010): token buckets per API key and per user, in Postgres, so the limit
+  # holds across replicas. perMinute = sustained rate, burst = bucket size. 0 turns a limit off.
+  # Refused requests get 429 + Retry-After and an audit row with outcome `rate_limited`.
+  rateLimit:
+    perKey:
+      perMinute: 120
+      burst: 60
+    perUser:
+      perMinute: 240
+      burst: 120
   # Hosts the SSRF guard lets the gateway reach on private IPs (comma-separated, exact or *.suffix).
   # Empty = exactly the in-cluster upstreams this chart deploys (when enabled):
   # <release>-woo-mcp.<namespace>.svc.cluster.local and <release>-everything.<namespace>.svc...
   # No wildcard by default, so Postgres, MariaDB and WordPress are not reachable as "upstreams".
   upstreamAllowedHosts: ''
   image:
-    repository: ghcr.io/<owner>/urumi-mcp-gateway/gateway
+    repository: registry.gitlab.com/<group>/<project>/gateway
     # Empty = the chart's appVersion.
     tag: ''
     pullPolicy: IfNotPresent
@@ -254,6 +295,16 @@ gateway:
   # answers 503. Chat needs egress to api.anthropic.com:443.
   chatModel: claude-sonnet-5-5
   chatSecretKey: ANTHROPIC_API_KEY
+  # Discovery mode (ADR 012): when a user may call more than this many tools, the chat agent gets
+  # only gateway__search_tools + gateway__call_tool and finds tools by search. 0 = always.
+  # (MCP clients choose per request with /mcp?mode=discovery.)
+  chatDiscoveryThreshold: 40
+  # OAuth 2.1 for MCP clients (ADR 013). The gateway is the authorization server; its issuer is
+  # publicOrigin. Clients may register https and http://localhost|127.0.0.1|[::1] redirect URIs;
+  # list private-use schemes here to allow them too, e.g. [cursor] for Cursor's
+  # cursor://anysphere.cursor-retrieval/oauth/callback. Default: none.
+  oauth:
+    extraRedirectSchemes: []
   # Env var -> key inside `secretName`. The DB password comes from postgres.secretKeys.password.
   # (A GATEWAY_SESSION_SECRET key in the Secret is unused and harmless: sessions are DB tokens.)
   secretKeys:
@@ -267,3 +318,152 @@ gateway:
     limits:
       cpu: 500m
       memory: 256Mi
+
+# Hosted MCP servers (brief item 5; docs/adr/014-hosted-mcp.md): admins add an MCP server by
+# container image; the gateway runs it in `namespace` (Deployment + Service + optional env Secret)
+# with a fixed hardened pod template and registers it as an upstream once ready. The gateway gets a
+# ServiceAccount whose only rights are a Role in that namespace (Deployments/Services/Secrets write,
+# Pods read). The namespace enforces Pod Security `restricted`, a default-deny NetworkPolicy (ingress
+# only from the gateway; egress DNS, plus internet 80/443 for servers created with egress on), a
+# ResourceQuota and a LimitRange. Off by default: the chart then renders none of it.
+hosted:
+  enabled: false
+  namespace: urumi-hosted
+  # Created (and on uninstall deleted) by this chart. Set false to manage it yourself (it must carry
+  # the pod-security.kubernetes.io/enforce=restricted label).
+  createNamespace: true
+  # ServiceAccount the hosted pods run as (no token, no permissions).
+  serviceAccountName: hosted-mcp
+  # Image allow-list: registry/repository prefixes, each ending in '/'. Images elsewhere are refused
+  # with a clear error. Empty = nothing can be hosted.
+  allowedImages: []
+  # Refuse images that are not pinned by @sha256 digest.
+  requireDigest: false
+  # Most hosted servers at once (the quota below bounds resources regardless).
+  maxServers: 5
+  quota:
+    pods: '6'
+    requests.cpu: 300m
+    requests.memory: 768Mi
+    limits.cpu: '3'
+    limits.memory: 1536Mi
+
+# Multiple stores (brief bonus; docs/adr/015-multi-store.md): admins create and delete extra
+# WooCommerce stores from the dashboard (Stores page / POST /api/stores). The gateway provisions each
+# in its own namespace `store-<slug>` (Pod Security restricted, ResourceQuota + LimitRange, default
+# deny NetworkPolicies, MariaDB, WordPress, the bootstrap Job from files/bootstrap, woo-mcp, an
+# Ingress for <slug>.<domainSuffix>) and registers its woo-mcp as the upstream `<slug>`. Stores are
+# runtime objects owned by the gateway, NOT by this release: helm upgrade/rollback leaves them alone.
+# RBAC (templates/stores/rbac.yaml): a ClusterRole for namespaces + creating RoleBindings that may
+# only reference the two ClusterRoles below (`bind` with resourceNames), and a ValidatingAdmission-
+# Policy that confines both to `store-*` namespaces carrying the store label. Off by default.
+multiStore:
+  enabled: false
+  # Most stores at once (deleting ones count until gone). Creation beyond it gets a clear 400.
+  maxStores: 3
+  # Storefronts: <scheme>://<slug>.<domainSuffix> (a wildcard DNS name pointing at the ingress).
+  domainSuffix: store.localtest.me
+  scheme: http
+  # https only: an existing TLS Secret of that name must exist in each store namespace (not managed).
+  tlsSecretName: ''
+  # A store not ready after this many minutes is Failed with the step it was stuck on (Retry).
+  provisionTimeoutMinutes: 10
+  # ValidatingAdmissionPolicy (Kubernetes >= 1.30) that limits the gateway's cluster-wide rights to
+  # store namespaces. Keep it on; without it the gateway could create/delete ANY namespace.
+  admissionPolicy:
+    enabled: true
+  persistence:
+    storageClass: ''
+    mariadb: 1Gi
+    wordpress: 1Gi
+  # Small on purpose (one extra store must fit next to the platform on an 8 GB laptop).
+  resources:
+    mariadb:
+      requests: { cpu: 25m, memory: 128Mi }
+      limits: { cpu: 500m, memory: 320Mi }
+    wordpress:
+      requests: { cpu: 25m, memory: 96Mi }
+      limits: { cpu: '1', memory: 384Mi }
+    wooMcp:
+      requests: { cpu: 10m, memory: 32Mi }
+      limits: { cpu: 200m, memory: 128Mi }
+    wpCli:
+      requests: { cpu: 50m, memory: 96Mi }
+      limits: { cpu: '1', memory: 512Mi }
+    kubectl:
+      requests: { cpu: 10m, memory: 32Mi }
+      limits: { cpu: 200m, memory: 128Mi }
+  # Per store namespace, whatever the gateway asks for.
+  quota:
+    pods: '6'
+    requests.cpu: 300m
+    requests.memory: 512Mi
+    limits.cpu: '3'
+    limits.memory: 1536Mi
+    persistentvolumeclaims: '2'
+    requests.storage: 4Gi
+    services.nodeports: '0'
+    services.loadbalancers: '0'
+
+# NetworkPolicies (brief item 6; docs/adr/009-network-policies.md, templates/networkpolicy/):
+# a namespace-wide default deny for ingress AND egress, plus an allow policy per real flow
+# (Traefik -> dashboard/gateway/WordPress; gateway -> Postgres, woo-mcp, everything, internet
+# 80/443; woo-mcp -> WordPress; WordPress -> MariaDB (+ internet); bootstrap Job -> MariaDB,
+# WordPress, Kubernetes API, internet; every pod -> cluster DNS). Needs a CNI that enforces
+# NetworkPolicy (k3s's built-in kube-router does).
+networkPolicy:
+  enabled: true
+  # Where the ingress controller's pods run (k3s: Traefik in kube-system).
+  ingressController:
+    namespace: kube-system
+    podLabels:
+      app.kubernetes.io/name: traefik
+  # Cluster DNS pods (k3s: CoreDNS in kube-system).
+  dns:
+    namespace: kube-system
+    podLabels:
+      k8s-app: kube-dns
+  # Kubernetes API for the bootstrap Job's kubectl: the `kubernetes` Service's endpoint
+  # (control-plane IP, port 6443 on k3s). Narrow `cidr` to that IP/32 when it is known.
+  kubeApi:
+    cidr: 0.0.0.0/0
+    ports: [443, 6443]
+  # "Internet" egress (gateway, bootstrap Job, and WordPress if enabled below): these ports to any
+  # address except private, loopback, link-local (metadata) and CGNAT ranges.
+  internet:
+    ports: [80, 443]
+    except:
+      - 10.0.0.0/8
+      - 172.16.0.0/12
+      - 192.168.0.0/16
+      - 100.64.0.0/10
+      - 169.254.0.0/16
+      - 127.0.0.0/8
+  # WordPress itself may reach the internet (update checks; on a VPS, its own public URL).
+  wordpressInternetEgress: true
+
+# Canary of the gateway (#23, H2; docs/adr/003-canary.md). Off by default; driven by
+# scripts/canary/run.sh, decided by scripts/canary/verdict.py. When enabled: a second Deployment
+# <release>-gateway-canary (the stable pod template, 1 replica, image tag below, label
+# track=canary) with its own Service, and a Traefik IngressRoute (traefik.io/v1alpha1, shipped
+# with k3s) that sends `weight` % of /api and /mcp on app.host to it. Same Postgres as stable.
+gatewayCanary:
+  enabled: false
+  # Percent of /api + /mcp requests the canary receives (0..100); the stable gateway gets the rest.
+  weight: 20
+  image:
+    # Empty = gateway.image.repository.
+    repository: ''
+    # Required when enabled.
+    tag: ''
+    # Empty = gateway.image.pullPolicy.
+    pullPolicy: ''
+  # FORCED BAD RELEASE demo only: FAULT_INJECT_ERROR_RATE (0..1) of tools/call requests fail with a
+  # 500 and FAULT_INJECT_LATENCY_MS delays each one, on the canary pod only. 0 = off.
+  faultInject:
+    errorRate: 0
+    latencyMs: 0
+  # Traefik entry points of the IngressRoute. Empty = [websecure] when app.tls.enabled, else [web].
+  entryPoints: []
+  # Router priority: above the app Ingress's rules (Traefik's default is the rule length).
+  priority: 1000

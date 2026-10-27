@@ -11,13 +11,36 @@ import { registerChatRoutes } from './chat/routes.js';
 import { createChatService } from './chat/service.js';
 import { createCallTool, type CallRecord, type CallTool } from './core/call-tool.js';
 import { ToolRegistry } from './core/registry.js';
+import { createListToolsFor, type ListToolsFor } from './core/visible-tools.js';
+import { createDiscovery } from './discovery/meta-tools.js';
+import { registerCanary } from './http/canary.js';
 import { registerCsrfGuard } from './http/csrf.js';
 import { HttpError } from './http/errors.js';
 import { registerKeyRoutes } from './keys/routes.js';
 import { registerMcpEndpoint } from './mcp/endpoint.js';
+import type { GatewayMetrics } from './metrics/metrics.js';
+import { registerMetricsRoutes } from './metrics/summary.js';
+import { registerConsentRoutes } from './oauth/consent-routes.js';
+import {
+  registerOAuthRoutes,
+  resourceMetadataUrl,
+  resourceUrl,
+  type OAuthLimits,
+} from './oauth/routes.js';
+import { registerPermissionRoutes } from './permissions/routes.js';
 import { UpstreamClient } from './mcp-client/upstream-client.js';
+import { PgTokenBucket, type McpRateLimits } from './ratelimit/bucket.js';
 import { registerToolRoutes } from './tools/routes.js';
 import { registerUpstreamRoutes } from './upstreams/routes.js';
+import type { Lease } from './core/leader.js';
+import { normaliseAllowList } from './hosted/images.js';
+import type { KubeApi } from './hosted/kube.js';
+import { HostedReconciler } from './hosted/reconciler.js';
+import { registerHostedRoutes } from './hosted/routes.js';
+import type { StoreKubeApi } from './stores/kube.js';
+import { StoreProvisioner } from './stores/provisioner.js';
+import { registerStoreRoutes } from './stores/routes.js';
+import type { StoreSettings } from './stores/settings.js';
 import type { LookupFn } from './upstreams/ssrf.js';
 import { registerUserRoutes } from './users/routes.js';
 
@@ -26,12 +49,18 @@ export const READY_TIMEOUT_MS = 1000;
 /** Aggregation and the one call path, shared by routes, the MCP endpoint (#15) and chat (#19). */
 export interface ToolService {
   registry: ToolRegistry;
+  /** The tools a user may see (tool permissions applied): every tool list goes through this. */
+  listToolsFor: ListToolsFor;
   callTool: CallTool;
 }
 
 declare module 'fastify' {
   interface FastifyInstance {
     tools: ToolService;
+    /** Hosted-server reconciler (ADR 014); null when hosting is off. main.ts starts it. */
+    hostedReconciler: HostedReconciler | null;
+    /** Store provisioner (ADR 015); null when multi-store is off. main.ts starts it. */
+    storeProvisioner: StoreProvisioner | null;
   }
 }
 
@@ -62,7 +91,51 @@ export interface AppDeps {
    * Chat agent (#19). `anthropic` is null (or `chat` absent) when ANTHROPIC_API_KEY is unset:
    * /api/chat then answers 503. Tests inject a scripted client.
    */
-  chat?: { anthropic: AnthropicLike | null; model?: string };
+  chat?: { anthropic: AnthropicLike | null; model?: string; discoveryThreshold?: number };
+  /** Canary (#23): x-urumi-track header value (TRACK). Default none. */
+  track?: string | null;
+  /** Forced-bad-release demo only (FAULT_INJECT_*): see src/http/canary.ts. Default off. */
+  faultInject?: { errorRate: number; latencyMs: number };
+  /** /mcp per-key and per-user token buckets in Postgres (ADR 010). Default: no limit. */
+  mcpRateLimits?: McpRateLimits;
+  /** Prometheus metrics (ADR 011); main.ts serves them on the internal port. Default: none. */
+  metrics?: GatewayMetrics;
+  /**
+   * OAuth 2.1 for MCP clients (ADR 013); the issuer is publicOrigin. `redirectSchemes`: extra
+   * private-use redirect URI schemes (OAUTH_REDIRECT_SCHEMES). `limits`: tests shrink them.
+   */
+  oauth?: { redirectSchemes?: readonly string[]; limits?: Partial<OAuthLimits> };
+  /**
+   * Hosted MCP servers (ADR 014). Absent: the API lists nothing new and refuses creates. main.ts
+   * passes an HttpKubeApi; tests pass an in-memory fake. `namespace` also scopes the SSRF guard's
+   * per-row exception for hosted upstream rows.
+   */
+  hosted?: {
+    kube: KubeApi;
+    namespace: string;
+    serviceAccountName: string;
+    allowedImages: readonly string[];
+    requireDigest?: boolean;
+    maxServers?: number;
+    lease?: Lease;
+    intervalMs?: number;
+  };
+  /**
+   * Multiple stores (ADR 015). Absent: GET /api/stores shows the built-in store only and creates
+   * are refused. main.ts passes an HttpStoreKubeApi; tests pass an in-memory fake.
+   */
+  stores?: {
+    kube: StoreKubeApi;
+    settings: StoreSettings;
+    maxStores: number;
+    scripts: Record<string, string>;
+    lease?: Lease;
+    intervalMs?: number;
+    now?: () => Date;
+    random?: () => string;
+  };
+  /** The chart's own store (upstream `woo`), listed as built-in. */
+  builtInStore?: { name: string; slug: string; storefrontUrl: string } | null;
 }
 
 /**
@@ -81,6 +154,9 @@ export const LOGGER_OPTIONS = {
       'credential',
       '*.credential',
       'req.body.credential',
+      'req.body.env',
+      'env',
+      '*.env',
     ],
     censor: '[redacted]',
   },
@@ -104,6 +180,11 @@ export function buildApp(deps: AppDeps): FastifyInstance {
   app.decorate('cookieSecure', deps.cookieSecure ?? false);
   app.decorateRequest('user', null);
   app.decorateRequest('sessionId', null);
+  registerCanary(app, {
+    track: deps.track ?? null,
+    faultErrorRate: deps.faultInject?.errorRate ?? 0,
+    faultLatencyMs: deps.faultInject?.latencyMs ?? 0,
+  });
 
   // Probes run every few seconds; keep them out of the info log.
   app.get('/healthz', { logLevel: 'warn' }, async () => ({ status: 'ok' }));
@@ -138,7 +219,8 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     return reply.code(500).send(makeError('INTERNAL', 'Internal error'));
   });
 
-  registerCsrfGuard(app, deps.publicOrigin ?? 'http://app.localtest.me');
+  const publicOrigin = deps.publicOrigin ?? 'http://app.localtest.me';
+  registerCsrfGuard(app, publicOrigin);
   registerAuthRoutes(app, {
     email: new LoginLimiter(),
     ip: new LoginLimiter({ maxFailures: IP_MAX_FAILURES }),
@@ -149,6 +231,8 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     encKey: deps.encKey,
     allowedHosts,
     ...lookup,
+    ...(deps.hosted ? { hostedNamespace: deps.hosted.namespace } : {}),
+    ...(deps.stores ? { storeHosts: true } : {}),
     log: app.log,
   });
   const registry = new ToolRegistry({
@@ -165,26 +249,103 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     log: app.log,
     ...(deps.mcpTimeouts?.callMs ? { callTimeoutMs: deps.mcpTimeouts.callMs } : {}),
     onCallFinished: async (record) => {
+      deps.metrics?.observeCall(record);
       await writeAudit(record);
       await deps.onCallFinished?.(record);
     },
   });
-  app.decorate('tools', { registry, callTool });
+  const listToolsFor = createListToolsFor(deps.pool, registry);
+  const discovery = createDiscovery({ listToolsFor, callTool });
+  app.decorate('tools', { registry, listToolsFor, callTool });
 
   registerUserRoutes(app);
   registerKeyRoutes(app);
   registerUpstreamRoutes(app, { encKey: deps.encKey, allowedHosts, ...lookup, registry });
-  registerToolRoutes(app, registry);
+  registerToolRoutes(app, { registry, listToolsFor });
+  const hostedReconciler = deps.hosted
+    ? new HostedReconciler({
+        pool: deps.pool,
+        kube: deps.hosted.kube,
+        registry,
+        encKey: deps.encKey,
+        log: app.log,
+        namespace: deps.hosted.namespace,
+        serviceAccountName: deps.hosted.serviceAccountName,
+        ...(deps.hosted.lease ? { lease: deps.hosted.lease } : {}),
+        ...(deps.hosted.intervalMs ? { intervalMs: deps.hosted.intervalMs } : {}),
+      })
+    : null;
+  app.decorate('hostedReconciler', hostedReconciler);
+  registerHostedRoutes(app, {
+    encKey: deps.encKey,
+    registry,
+    reconciler: hostedReconciler,
+    namespace: deps.hosted?.namespace ?? 'urumi-hosted',
+    allowedImages: normaliseAllowList(deps.hosted?.allowedImages ?? []),
+    requireDigest: deps.hosted?.requireDigest ?? false,
+    maxServers: deps.hosted?.maxServers ?? 5,
+  });
+  const storeProvisioner = deps.stores
+    ? new StoreProvisioner({
+        pool: deps.pool,
+        kube: deps.stores.kube,
+        registry,
+        encKey: deps.encKey,
+        log: app.log,
+        settings: deps.stores.settings,
+        scripts: deps.stores.scripts,
+        ...(deps.stores.lease ? { lease: deps.stores.lease } : {}),
+        ...(deps.stores.intervalMs ? { intervalMs: deps.stores.intervalMs } : {}),
+        ...(deps.stores.now ? { now: deps.stores.now } : {}),
+        ...(deps.stores.random ? { random: deps.stores.random } : {}),
+      })
+    : null;
+  app.decorate('storeProvisioner', storeProvisioner);
+  registerStoreRoutes(app, {
+    encKey: deps.encKey,
+    registry,
+    provisioner: storeProvisioner,
+    maxStores: deps.stores?.maxStores ?? 0,
+    domainSuffix: deps.stores?.settings.domainSuffix ?? '',
+    scheme: deps.stores?.settings.scheme ?? 'http',
+    builtIn: deps.builtInStore ?? null,
+  });
   registerAuditRoutes(app);
-  registerMcpEndpoint(app, { registry, callTool });
+  registerPermissionRoutes(app);
+  registerMcpEndpoint(app, {
+    listToolsFor,
+    callTool,
+    discovery,
+    rateLimit: deps.mcpRateLimits
+      ? { bucket: new PgTokenBucket(deps.pool), limits: deps.mcpRateLimits }
+      : undefined,
+    audit: writeAudit,
+    onRateLimited: deps.metrics ? (scope) => deps.metrics!.observeRateLimited(scope) : undefined,
+    oauth: {
+      resource: resourceUrl(publicOrigin),
+      resourceMetadataUrl: resourceMetadataUrl(publicOrigin),
+    },
+  });
+  registerOAuthRoutes(app, {
+    issuer: publicOrigin,
+    redirectPolicy: { extraSchemes: deps.oauth?.redirectSchemes ?? [] },
+    bucket: new PgTokenBucket(deps.pool),
+    ...(deps.oauth?.limits ? { limits: deps.oauth.limits } : {}),
+  });
+  registerConsentRoutes(app, { issuer: publicOrigin });
+  registerMetricsRoutes(app);
   const anthropic = deps.chat?.anthropic;
   registerChatRoutes(app, {
     service: anthropic
       ? createChatService({
           anthropic,
-          listTools: () => registry.listTools(),
+          listToolsFor,
           callTool,
           ...(deps.chat?.model ? { model: deps.chat.model } : {}),
+          discovery,
+          ...(deps.chat?.discoveryThreshold !== undefined
+            ? { discoveryThreshold: deps.chat.discoveryThreshold }
+            : {}),
         })
       : null,
     limiter: new ChatRateLimiter(),
